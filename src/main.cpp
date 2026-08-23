@@ -43,6 +43,12 @@ unsigned long lastPrint = 0;
 const uint32_t DHCP_RETRY_INTERVAL = 5000;
 const uint32_t INTERNET_CHECK_INTERVAL = 30000;
 
+void ethernetTask();
+void checkInternet();
+const char* getLanStatus();
+const char* getInternetStatus();
+void printStatus();
+
 
 
 // =========================
@@ -68,7 +74,18 @@ HardwareSerial RS485Serial(2);
 
 const uint8_t SLAVE_ID = 1;
 const uint16_t START_ADDR = 0;   // offset 0 = 40001
-const uint16_t NUM_REGS = 9;
+enum SlaveRegister : uint8_t {
+  REG_SAMPLE_FLOW = 0, REG_USAGE_DELTA, REG_SAMPLE_DELTA,
+  REG_USAGE_TOTAL_HI, REG_USAGE_TOTAL_LO, REG_PH, REG_TURBIDITY,
+  REG_VCC, REG_5V, REG_SYSTEM_STATUS, REG_SENSOR_STATUS,
+  REG_ERROR_DETAIL, NUM_REGS
+};
+
+enum SensorStatusMask : uint16_t {
+  SENSOR_FLOW_USAGE_OK = 0x0001, SENSOR_FLOW_SAMPLE_OK = 0x0004,
+  SENSOR_PH_OK = 0x0008, SENSOR_TURBIDITY_OK = 0x0010,
+  SENSOR_VCC_OK = 0x0020, SENSOR_5V_OK = 0x0040
+};
 
 // Buffer hasil baca register
 uint16_t regData[NUM_REGS];
@@ -141,21 +158,24 @@ enum PageMenu {
 uint8_t currentPage = PAGE_HOME;
 
 // =========================
-// Data simulasi
+// Data dari slave Modbus (holding register 40001-40012)
 // =========================
-float levelPercent = 0;
-float levelCm = 0;
 float flowRateSample = 0;
-uint32_t flowTotal = 0;
+uint16_t usagePulseDelta = 0;
+uint16_t samplePulseDelta = 0;
+uint32_t usagePulseTotal = 0;
 float phValue = 0;
 float turbidity = 0;
-float supplyVoltage = 0;
-uint16_t statusCode = 0;
+float slaveVcc = 0;
+float slave5V = 0;
+uint16_t systemStatus = 0;
+uint16_t sensorStatus = 0;
+uint16_t errorDetail = 0;
 
-bool alarmLowLevel = false;
 bool alarmPh = false;
 bool alarmTurbidity = false;
 bool alarmFlow = false;
+bool alarmSupply = false;
 bool rs485Status = false;
 // bool lanStatus = true;
 
@@ -171,14 +191,22 @@ bool cbRead(Modbus::ResultCode event, uint16_t transactionId, void* data) {
   if (event == Modbus::EX_SUCCESS) {
     Serial.println("===== DATA DARI SLAVE =====");
 
-    levelPercent    = regData[0] / 10.0;
-    levelCm         = regData[1] / 10.0;
-    flowRateSample  = regData[2] / 10.0;
-    flowTotal       = ((uint32_t)regData[3] << 16) | regData[4];
-    phValue         = regData[5] / 100.0;
-    turbidity       = regData[6] / 10.0;
-    supplyVoltage   = regData[7] / 100.0;
-    statusCode      = regData[8];
+    flowRateSample = regData[REG_SAMPLE_FLOW] / 100.0f;
+    usagePulseDelta = regData[REG_USAGE_DELTA];
+    samplePulseDelta = regData[REG_SAMPLE_DELTA];
+    usagePulseTotal = ((uint32_t)regData[REG_USAGE_TOTAL_HI] << 16) | regData[REG_USAGE_TOTAL_LO];
+    phValue = regData[REG_PH] / 100.0f;
+    turbidity = regData[REG_TURBIDITY] / 10.0f;
+    slaveVcc = regData[REG_VCC] / 100.0f;
+    slave5V = regData[REG_5V] / 100.0f;
+    systemStatus = regData[REG_SYSTEM_STATUS];
+    sensorStatus = regData[REG_SENSOR_STATUS];
+    errorDetail = regData[REG_ERROR_DETAIL];
+
+    alarmFlow = !(sensorStatus & SENSOR_FLOW_USAGE_OK) || !(sensorStatus & SENSOR_FLOW_SAMPLE_OK);
+    alarmPh = !(sensorStatus & SENSOR_PH_OK);
+    alarmTurbidity = !(sensorStatus & SENSOR_TURBIDITY_OK);
+    alarmSupply = !(sensorStatus & SENSOR_VCC_OK) || !(sensorStatus & SENSOR_5V_OK);
 
     rs485Status = true;
 
@@ -230,29 +258,9 @@ bool buttonPressed(uint8_t pin, bool &lastState) {
 }
 
 int getTotalAlarm() {
-  return alarmLowLevel + alarmPh + alarmTurbidity + alarmFlow;
+  return alarmPh + alarmTurbidity + alarmFlow + alarmSupply;
 }
 
-void updateRandomData() {
-  levelPercent = random(150, 1000) / 10.0;      // 15.0 - 100.0
-  levelCm      = random(100, 2500) / 10.0;      // 10.0 - 250.0 cm
-  flowRateSample     = random(0, 350) / 10.0;         // 0.0 - 35.0 L/min
-  flowTotal   += random(1, 15);                 // total bertambah
-  phValue      = random(550, 900) / 100.0;      // 5.50 - 9.00
-  turbidity    = random(0, 150) / 10.0;         // 0.0 - 15.0 NTU
-  supplyVoltage= random(1150, 1320) / 100.0;    // 11.50 - 13.20 V
-
-  // simulasi status komunikasi
-  // rs485Status = random(0, 100) > 10;            // 90% normal
-  // lanStatus  = random(0, 100) > 15;            // 85% normal
-  // serverStatus    = random(45, 90);                // -45 s/d -90 dBm
-
-  // alarm simulasi
-  alarmLowLevel   = (levelPercent < 20.0);
-  alarmPh         = (phValue < 6.5 || phValue > 8.5);
-  alarmTurbidity  = (turbidity > 8.0);
-  alarmFlow       = (flowRateSample < 1.0);
-}
 
 void drawHeader(const char* title) {
   lcd.setFont(u8g2_font_6x10_tf);
@@ -316,7 +324,7 @@ void drawHomePage() {
 
   lcd.setFont(u8g2_font_6x10_tf);
 
-  sprintf(buf, "Level  : %.1f %%", levelPercent);
+  sprintf(buf, "Flow   : %.2f L/m", flowRateSample);
   lcd.drawStr(2, 22, buf);
 
   sprintf(buf, "pH     : %.2f", phValue);
@@ -335,19 +343,19 @@ void drawSensorPage() {
 
   lcd.setFont(u8g2_font_5x7_tf);
 
-  sprintf(buf, "Level %%     : %.1f", levelPercent);
+  sprintf(buf, "Flow rate : %.2f L/m", flowRateSample);
   lcd.drawStr(2, 22, buf);
 
-  sprintf(buf, "Level cm    : %.1f", levelCm);
+  sprintf(buf, "Pulse use : %u", usagePulseDelta);
   lcd.drawStr(2, 32, buf);
 
-  sprintf(buf, "pH/Turb     : %.2f / %.1f", phValue, turbidity);
+  sprintf(buf, "Pulse smp : %u", samplePulseDelta);
   lcd.drawStr(2, 42, buf);
 
-  sprintf(buf, "This Month  : %lu KL", flowTotal/1000);
+  sprintf(buf, "Total use : %lu", (unsigned long)usagePulseTotal);
   lcd.drawStr(2, 52, buf);
 
-  sprintf(buf, "Sample flow : %.1f L/m", flowRateSample);
+  sprintf(buf, "pH/Turb   : %.2f/%.1f", phValue, turbidity);
   lcd.drawStr(2, 62, buf);
 }
 
@@ -355,8 +363,8 @@ void drawAlarmPage() {
   drawHeader("STATUS ALARM");
   lcd.setFont(u8g2_font_5x7_tf);
 
-  lcd.drawStr(2, 22, "Low Level :");
-  lcd.drawStr(62, 22, alarmLowLevel ? "ACTIVE" : "NORMAL");
+  lcd.drawStr(2, 22, "Flow      :");
+  lcd.drawStr(62, 22, alarmFlow ? "ERROR" : "NORMAL");
 
   lcd.drawStr(2, 32, "pH Error  :");
   lcd.drawStr(62, 32, alarmPh ? "ACTIVE" : "NORMAL");
@@ -364,12 +372,12 @@ void drawAlarmPage() {
   lcd.drawStr(2, 42, "Turbidity :");
   lcd.drawStr(62, 42, alarmTurbidity ? "ACTIVE" : "NORMAL");
 
-  lcd.drawStr(2, 52, "Flow Low  :");
-  lcd.drawStr(62, 52, alarmFlow ? "ACTIVE" : "NORMAL");
+  lcd.drawStr(2, 52, "Supply    :");
+  lcd.drawStr(62, 52, alarmSupply ? "ERROR" : "NORMAL");
 
-  int totalAlarm = alarmLowLevel + alarmPh + alarmTurbidity + alarmFlow;
+
   char buf[22];
-  sprintf(buf, "Total Alarm: %d", totalAlarm);
+  sprintf(buf, "Sys:%u Error:%u", systemStatus, errorDetail);
   lcd.drawStr(2, 62, buf);
 }
 
@@ -383,13 +391,13 @@ void drawVoltagePage(){
   sprintf(buf, "VCC Mstr  : %.2f V", vin_vcc);
   lcd.drawStr(2, 22, buf);
 
-  sprintf(buf, "VCC Slv   : %.2f V", vin_vcc); // temporary
+  sprintf(buf, "VCC Slv   : %.2f V", slaveVcc);
   lcd.drawStr(2, 32, buf);
 
   sprintf(buf, "5V Mstr   : %.2f V", vin_5v);
   lcd.drawStr(2, 42, buf);
     
-  sprintf(buf, "5V Slv    : %.2f V", vin_5v); // temporary
+  sprintf(buf, "5V Slv    : %.2f V", slave5V);
   lcd.drawStr(2, 52, buf);
 
   sprintf(buf, "3.3V Mstr : %.2f V", vin_3v3);
@@ -415,7 +423,7 @@ void drawCommPage() {
   sprintf(buf, "INTERNET   : %s", getInternetStatus());
   lcd.drawStr(2, 52, buf);
 
-  sprintf(buf, "Supply     : %.2f V", supplyVoltage);
+  sprintf(buf, "Status     : %u/%u", systemStatus, errorDetail);
   lcd.drawStr(2, 62, buf);
 }
 
@@ -487,8 +495,8 @@ void handleButtons() {
 
     // OK
     if ((changed & (1 << BTN_OK)) && isPressed(state, BTN_OK)) {
-      updateRandomData();
-      drawPage();
+      // Jadwalkan polling segera; data layar tidak lagi diisi simulasi.
+      lastPoll = millis() - pollInterval;
       lastDebounceTime = millis();
     }
 
@@ -543,8 +551,8 @@ void loop() {
     lastPoll = millis();
     drawPage();
 
-    // Baca 9 holding register mulai dari offset 0
-    // = address 40001 s/d 40009
+    // Baca 12 holding register mulai dari offset 0
+    // = address 40001 s/d 40012
     if (mb.readHreg(SLAVE_ID, START_ADDR, regData, NUM_REGS, cbRead)) {
       mbBusy = true;
     } else {
