@@ -72,8 +72,8 @@ ModbusRTU mb;
 
 HardwareSerial RS485Serial(2);
 
-const uint8_t SLAVE_ID = 1;
-const uint16_t START_ADDR = 0;   // offset 0 = 40001
+const uint8_t HSM_SLAVE_ID = 9;
+const uint16_t HSM_START_ADDR = 0;   // offset 0 = 40001
 enum SlaveRegister : uint8_t {
   REG_SAMPLE_FLOW = 0, REG_USAGE_DELTA, REG_SAMPLE_DELTA,
   REG_USAGE_TOTAL_HI, REG_USAGE_TOTAL_LO, REG_PH, REG_TURBIDITY,
@@ -90,10 +90,23 @@ enum SensorStatusMask : uint16_t {
 // Buffer hasil baca register
 uint16_t regData[NUM_REGS];
 
+const uint8_t ULTRASONIC_SLAVE_ID = 1;
+const uint16_t ULTRASONIC_ADDR = 257;
+uint16_t ultrasonicReg = 250;
+float ultrasonicDistanceCm = 25.0f;
+bool ultrasonicStatus = false;
+
+enum PollTarget : uint8_t {
+  POLL_HSM,
+  POLL_ULTRASONIC
+};
+
+PollTarget pollTarget = POLL_HSM;
+
 // Status polling
 bool mbBusy = false;
 unsigned long lastPoll = 0;
-const unsigned long pollInterval = 3000; // 1 detik
+const unsigned long pollInterval = 1000; // tiap slave dipoll sekitar 2 detik
 
 // =========================
 // Tombol I2C PCF8574
@@ -148,6 +161,7 @@ float vin_vcc;
 enum PageMenu {
   PAGE_HOME = 0,
   PAGE_SENSOR,
+  PAGE_ULTRASONIC,
   PAGE_ALARM,
   PAGE_VOLTAGE,
   PAGE_COMM,
@@ -222,6 +236,26 @@ bool cbRead(Modbus::ResultCode event, uint16_t transactionId, void* data) {
 // ==========================
 // READ BOARD VOLTAGE SENSOR
 // ==========================
+bool cbUltrasonic(Modbus::ResultCode event, uint16_t transactionId, void* data) {
+  mbBusy = false;
+
+  if (event == Modbus::EX_SUCCESS) {
+    ultrasonicDistanceCm = ultrasonicReg / 10.0f;
+    ultrasonicStatus = true;
+    Serial.println("===== DATA ULTRASONIC =====");
+    Serial.print("Raw      : ");
+    Serial.println(ultrasonicReg);
+    Serial.print("Distance : ");
+    Serial.print(ultrasonicDistanceCm, 1);
+    Serial.println(" cm");
+  } else {
+    ultrasonicStatus = false;
+    Serial.print("Gagal baca ultrasonic. ResultCode: ");
+    Serial.println((int)event);
+  }
+
+  return true;
+}
 void readBoardVoltage(){
   float vout_3v3 = analogRead(PIN_3V3) * (3.3 / 4095.0);
   vin_3v3  = 1.17 * (vout_3v3 * (R1 + R2) / R2);
@@ -359,6 +393,23 @@ void drawSensorPage() {
   lcd.drawStr(2, 62, buf);
 }
 
+void drawUltrasonicPage() {
+  char buf[32];
+
+  drawHeader("ULTRASONIC");
+  lcd.setFont(u8g2_font_6x10_tf);
+
+  sprintf(buf, "Distance: %.1f cm", ultrasonicDistanceCm);
+  lcd.drawStr(2, 25, buf);
+
+  sprintf(buf, "Raw     : %u", ultrasonicReg);
+  lcd.drawStr(2, 38, buf);
+
+  sprintf(buf, "ID:%u Reg:%u", ULTRASONIC_SLAVE_ID, ULTRASONIC_ADDR);
+  lcd.drawStr(2, 50, buf);
+
+  drawFooter();
+}
 void drawAlarmPage() {
   drawHeader("STATUS ALARM");
   lcd.setFont(u8g2_font_5x7_tf);
@@ -411,7 +462,7 @@ void drawCommPage() {
   drawHeader("KOMUNIKASI");
   lcd.setFont(u8g2_font_5x7_tf);
 
-  sprintf(buf, "Slave ID   : %d", SLAVE_ID);
+  sprintf(buf, "HSM/US ID  : %u/%u", HSM_SLAVE_ID, ULTRASONIC_SLAVE_ID);
   lcd.drawStr(2, 22, buf);
 
   sprintf(buf, "RS485      : %s", rs485Status ? "CONNECTED" : "TIMEOUT");
@@ -451,6 +502,9 @@ void drawPage() {
       break;
     case PAGE_SENSOR:
       drawSensorPage();
+      break;
+    case PAGE_ULTRASONIC:
+      drawUltrasonicPage();
       break;
     case PAGE_ALARM:
       drawAlarmPage();
@@ -551,12 +605,23 @@ void loop() {
     lastPoll = millis();
     drawPage();
 
-    // Baca 12 holding register mulai dari offset 0
-    // = address 40001 s/d 40012
-    if (mb.readHreg(SLAVE_ID, START_ADDR, regData, NUM_REGS, cbRead)) {
-      mbBusy = true;
+    if (pollTarget == POLL_HSM) {
+      // HSM: slave ID 9, holding register 40001-40012 (offset 0-11).
+      if (mb.readHreg(HSM_SLAVE_ID, HSM_START_ADDR, regData, NUM_REGS, cbRead)) {
+        mbBusy = true;
+        pollTarget = POLL_ULTRASONIC;
+      } else {
+        Serial.println("Request HSM gagal dikirim");
+      }
     } else {
-      Serial.println("Request readHreg gagal dikirim");
+      // Ultrasonic: slave ID 1, holding register address 257, scaling /10 cm.
+      if (mb.readHreg(ULTRASONIC_SLAVE_ID, ULTRASONIC_ADDR,
+                      &ultrasonicReg, 1, cbUltrasonic)) {
+        mbBusy = true;
+        pollTarget = POLL_HSM;
+      } else {
+        Serial.println("Request ultrasonic gagal dikirim");
+      }
     }
   }
 
