@@ -73,7 +73,7 @@ ModbusRTU mb;
 HardwareSerial RS485Serial(2);
 
 const uint8_t HSM_SLAVE_ID = 9;
-const uint16_t HSM_START_ADDR = 0;   // offset 0 = 40001
+const uint16_t HSM_START_ADDR = 1;   // offset 0 = 40001
 enum SlaveRegister : uint8_t {
   REG_SAMPLE_FLOW = 0, REG_USAGE_DELTA, REG_SAMPLE_DELTA,
   REG_USAGE_TOTAL_HI, REG_USAGE_TOTAL_LO, REG_PH, REG_TURBIDITY,
@@ -106,7 +106,7 @@ PollTarget pollTarget = POLL_HSM;
 // Status polling
 bool mbBusy = false;
 unsigned long lastPoll = 0;
-const unsigned long pollInterval = 1000; // tiap slave dipoll sekitar 2 detik
+const unsigned long pollInterval = 2000; // tiap slave dipoll sekitar 2 detik
 
 // =========================
 // Tombol I2C PCF8574
