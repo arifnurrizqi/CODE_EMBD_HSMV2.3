@@ -4,6 +4,7 @@
 #include <ModbusRTU.h>
 #include <SPI.h>
 #include <Ethernet.h>
+#include <Preferences.h>
 
 // ==========================
 // KONFIGURASI MODBUS RS485
@@ -72,7 +73,6 @@ ModbusRTU mb;
 
 HardwareSerial RS485Serial(2);
 
-const uint8_t HSM_SLAVE_ID = 9;
 const uint16_t HSM_START_ADDR = 0;   // offset 0 = 40001
 enum SlaveRegister : uint8_t {
   REG_SAMPLE_FLOW = 0, REG_USAGE_DELTA, REG_SAMPLE_DELTA,
@@ -90,8 +90,6 @@ enum SensorStatusMask : uint16_t {
 // Buffer hasil baca register
 uint16_t regData[NUM_REGS];
 
-const uint8_t ULTRASONIC_SLAVE_ID = 1;
-const uint16_t ULTRASONIC_ADDR = 257;
 uint16_t ultrasonicReg = 250;
 float ultrasonicDistanceCm = 25.0f;
 bool ultrasonicStatus = false;
@@ -102,11 +100,51 @@ enum PollTarget : uint8_t {
 };
 
 PollTarget pollTarget = POLL_HSM;
+unsigned long lastPoll = 0;
+
+struct DeviceConfig {
+  uint8_t hsmSlaveId = 9;
+  uint8_t ultrasonicSlaveId = 1;
+  uint16_t ultrasonicAddress = 257;
+  uint16_t ultrasonicScale = 10;
+  uint32_t pollIntervalMs = 2000;
+};
+
+Preferences preferences;
+DeviceConfig config;
+DeviceConfig editConfig;
+
+void loadConfig() {
+  preferences.begin("hydroflow", true);
+  config.hsmSlaveId = preferences.getUChar("hsm_id", 9);
+  config.ultrasonicSlaveId = preferences.getUChar("us_id", 1);
+  config.ultrasonicAddress = preferences.getUShort("us_addr", 257);
+  config.ultrasonicScale = preferences.getUShort("us_scale", 10);
+  config.pollIntervalMs = preferences.getULong("poll_ms", 2000);
+  preferences.end();
+
+  if (config.hsmSlaveId < 1 || config.hsmSlaveId > 247) config.hsmSlaveId = 9;
+  if (config.ultrasonicSlaveId < 1 || config.ultrasonicSlaveId > 247) config.ultrasonicSlaveId = 1;
+  if (config.ultrasonicScale < 1 || config.ultrasonicScale > 1000) config.ultrasonicScale = 10;
+  if (config.pollIntervalMs < 250 || config.pollIntervalMs > 60000) config.pollIntervalMs = 2000;
+}
+
+void saveConfig() {
+  config = editConfig;
+  preferences.begin("hydroflow", false);
+  preferences.putUChar("hsm_id", config.hsmSlaveId);
+  preferences.putUChar("us_id", config.ultrasonicSlaveId);
+  preferences.putUShort("us_addr", config.ultrasonicAddress);
+  preferences.putUShort("us_scale", config.ultrasonicScale);
+  preferences.putULong("poll_ms", config.pollIntervalMs);
+  preferences.end();
+  pollTarget = POLL_HSM;
+  lastPoll = millis() - config.pollIntervalMs;
+}
 
 // Status polling
 bool mbBusy = false;
-unsigned long lastPoll = 0;
-const unsigned long pollInterval = 2000; // tiap slave dipoll sekitar 2 detik
+// Interval polling disimpan pada config.pollIntervalMs.
 
 // =========================
 // Tombol I2C PCF8574
@@ -170,6 +208,27 @@ enum PageMenu {
 };
 
 uint8_t currentPage = PAGE_HOME;
+
+enum UiMode : uint8_t {
+  UI_NORMAL,
+  UI_MENU_LIST,
+  UI_MENU_EDIT
+};
+
+enum MenuItem : uint8_t {
+  MENU_HSM_ID,
+  MENU_ULTRASONIC_ID,
+  MENU_ULTRASONIC_ADDR,
+  MENU_ULTRASONIC_SCALE,
+  MENU_POLL_INTERVAL,
+  MENU_SAVE_EXIT,
+  MENU_CANCEL,
+  MENU_ITEM_COUNT
+};
+
+UiMode uiMode = UI_NORMAL;
+uint8_t selectedMenuItem = MENU_HSM_ID;
+bool menuIdConflict = false;
 
 // =========================
 // Data dari slave Modbus (holding register 40001-40012)
@@ -240,7 +299,7 @@ bool cbUltrasonic(Modbus::ResultCode event, uint16_t transactionId, void* data) 
   mbBusy = false;
 
   if (event == Modbus::EX_SUCCESS) {
-    ultrasonicDistanceCm = ultrasonicReg / 10.0f;
+    ultrasonicDistanceCm = ultrasonicReg / (float)config.ultrasonicScale;
     ultrasonicStatus = true;
     Serial.println("===== DATA ULTRASONIC =====");
     Serial.print("Raw      : ");
@@ -405,7 +464,7 @@ void drawUltrasonicPage() {
   sprintf(buf, "Raw     : %u", ultrasonicReg);
   lcd.drawStr(2, 38, buf);
 
-  sprintf(buf, "ID:%u Reg:%u", ULTRASONIC_SLAVE_ID, ULTRASONIC_ADDR);
+  sprintf(buf, "ID:%u Reg:%u", config.ultrasonicSlaveId, config.ultrasonicAddress);
   lcd.drawStr(2, 50, buf);
 
   drawFooter();
@@ -462,7 +521,7 @@ void drawCommPage() {
   drawHeader("KOMUNIKASI");
   lcd.setFont(u8g2_font_5x7_tf);
 
-  sprintf(buf, "HSM/US ID  : %u/%u", HSM_SLAVE_ID, ULTRASONIC_SLAVE_ID);
+  sprintf(buf, "HSM/US ID  : %u/%u", config.hsmSlaveId, config.ultrasonicSlaveId);
   lcd.drawStr(2, 22, buf);
 
   sprintf(buf, "RS485      : %s", rs485Status ? "CONNECTED" : "TIMEOUT");
@@ -493,8 +552,177 @@ void drawSystemPage() {
   lcd.drawStr(2, 62, buf);
 }
 
+const char* getMenuLabel(uint8_t item) {
+  switch (item) {
+    case MENU_HSM_ID: return "HSM ID";
+    case MENU_ULTRASONIC_ID: return "US ID";
+    case MENU_ULTRASONIC_ADDR: return "US ADDR";
+    case MENU_ULTRASONIC_SCALE: return "US SCALE";
+    case MENU_POLL_INTERVAL: return "POLL MS";
+    case MENU_SAVE_EXIT: return "SAVE & EXIT";
+    case MENU_CANCEL: return "CANCEL";
+    default: return "";
+  }
+}
+
+void formatMenuItem(uint8_t item, char* buf, size_t size) {
+  switch (item) {
+    case MENU_HSM_ID:
+      snprintf(buf, size, "%s: %u", getMenuLabel(item), editConfig.hsmSlaveId);
+      break;
+    case MENU_ULTRASONIC_ID:
+      snprintf(buf, size, "%s: %u", getMenuLabel(item), editConfig.ultrasonicSlaveId);
+      break;
+    case MENU_ULTRASONIC_ADDR:
+      snprintf(buf, size, "%s: %u", getMenuLabel(item), editConfig.ultrasonicAddress);
+      break;
+    case MENU_ULTRASONIC_SCALE:
+      snprintf(buf, size, "%s: /%u", getMenuLabel(item), editConfig.ultrasonicScale);
+      break;
+    case MENU_POLL_INTERVAL:
+      snprintf(buf, size, "%s: %lu", getMenuLabel(item), (unsigned long)editConfig.pollIntervalMs);
+      break;
+    default:
+      snprintf(buf, size, "%s", getMenuLabel(item));
+      break;
+  }
+}
+
+void drawConfigMenu() {
+  constexpr uint8_t VISIBLE_ITEMS = 4;
+  char buf[28];
+
+  lcd.setFont(u8g2_font_5x7_tf);
+  lcd.setDrawColor(1);
+  lcd.drawBox(0, 0, 128, 10);
+  lcd.setDrawColor(0);
+  lcd.drawStr(3, 8, uiMode == UI_MENU_EDIT ? "EDIT CONFIG" : "MENU CONFIG");
+  lcd.setDrawColor(1);
+
+  if (uiMode == UI_MENU_EDIT) {
+    formatMenuItem(selectedMenuItem, buf, sizeof(buf));
+    lcd.drawStr(3, 22, getMenuLabel(selectedMenuItem));
+    lcd.drawFrame(2, 27, 124, 15);
+
+    int valueWidth = lcd.getStrWidth(buf);
+    int valueX = max(4, (128 - valueWidth) / 2);
+    lcd.drawStr(valueX, 38, buf);
+
+    if (menuIdConflict) {
+      lcd.drawStr(3, 51, "ID HSM DAN US HARUS BEDA");
+    } else {
+      lcd.drawStr(3, 51, "UP/DOWN : UBAH NILAI");
+    }
+    lcd.drawStr(3, 62, "OK:SELESAI MENU:KEMBALI");
+    return;
+  }
+
+  uint8_t firstVisible = 0;
+  if (selectedMenuItem >= VISIBLE_ITEMS) {
+    firstVisible = selectedMenuItem - VISIBLE_ITEMS + 1;
+  }
+
+  for (uint8_t row = 0; row < VISIBLE_ITEMS; row++) {
+    uint8_t item = firstVisible + row;
+    if (item >= MENU_ITEM_COUNT) break;
+
+    int y = 12 + row * 10;
+    formatMenuItem(item, buf, sizeof(buf));
+
+    if (item == selectedMenuItem) {
+      lcd.drawBox(1, y, 126, 9);
+      lcd.setDrawColor(0);
+      lcd.drawStr(4, y + 7, buf);
+      lcd.setDrawColor(1);
+    } else {
+      lcd.drawStr(4, y + 7, buf);
+    }
+  }
+
+  lcd.drawHLine(0, 53, 128);
+  if (menuIdConflict) {
+    lcd.drawStr(3, 63, "ERROR: ID HARUS BERBEDA");
+  } else {
+    lcd.drawStr(3, 63, "OK:PILIH MENU:BATAL");
+  }
+}
+
+void adjustMenuValue(int8_t direction) {
+  menuIdConflict = false;
+  switch (selectedMenuItem) {
+    case MENU_HSM_ID:
+      editConfig.hsmSlaveId = constrain((int)editConfig.hsmSlaveId + direction, 1, 247);
+      break;
+    case MENU_ULTRASONIC_ID:
+      editConfig.ultrasonicSlaveId = constrain((int)editConfig.ultrasonicSlaveId + direction, 1, 247);
+      break;
+    case MENU_ULTRASONIC_ADDR:
+      editConfig.ultrasonicAddress = constrain((int32_t)editConfig.ultrasonicAddress + direction, 0L, 65535L);
+      break;
+    case MENU_ULTRASONIC_SCALE:
+      editConfig.ultrasonicScale = constrain((int)editConfig.ultrasonicScale + direction, 1, 1000);
+      break;
+    case MENU_POLL_INTERVAL:
+      editConfig.pollIntervalMs = constrain((int32_t)editConfig.pollIntervalMs + direction * 250L, 250L, 60000L);
+      break;
+  }
+}
+
+void enterConfigMenu() {
+  editConfig = config;
+  selectedMenuItem = MENU_HSM_ID;
+  menuIdConflict = false;
+  uiMode = UI_MENU_LIST;
+}
+
+void handleMenuButton(uint8_t button) {
+  if (button == BTN_MENU) {
+    if (uiMode == UI_MENU_EDIT) {
+      uiMode = UI_MENU_LIST;
+    } else {
+      editConfig = config;
+      uiMode = UI_NORMAL;
+    }
+    return;
+  }
+
+  if (uiMode == UI_MENU_EDIT) {
+    if (button == BTN_UP) adjustMenuValue(1);
+    else if (button == BTN_DOWN) adjustMenuValue(-1);
+    else if (button == BTN_OK) uiMode = UI_MENU_LIST;
+    return;
+  }
+
+  if (button == BTN_UP) {
+    selectedMenuItem = selectedMenuItem == 0 ? MENU_ITEM_COUNT - 1 : selectedMenuItem - 1;
+  } else if (button == BTN_DOWN) {
+    selectedMenuItem = (selectedMenuItem + 1) % MENU_ITEM_COUNT;
+  } else if (button == BTN_OK) {
+    if (selectedMenuItem <= MENU_POLL_INTERVAL) {
+      uiMode = UI_MENU_EDIT;
+    } else if (selectedMenuItem == MENU_SAVE_EXIT) {
+      if (editConfig.hsmSlaveId == editConfig.ultrasonicSlaveId) {
+        menuIdConflict = true;
+        selectedMenuItem = MENU_ULTRASONIC_ID;
+      } else {
+        saveConfig();
+        uiMode = UI_NORMAL;
+        Serial.println("Konfigurasi disimpan ke NVS");
+      }
+    } else {
+      editConfig = config;
+      uiMode = UI_NORMAL;
+    }
+  }
+}
 void drawPage() {
   lcd.clearBuffer();
+
+  if (uiMode != UI_NORMAL) {
+    drawConfigMenu();
+    lcd.sendBuffer();
+    return;
+  }
 
   switch (currentPage) {
     case PAGE_HOME:
@@ -525,47 +753,36 @@ void drawPage() {
 
 void handleButtons() {
   byte state = readPCF8574();
-
-  // deteksi perubahan
   byte changed = lastState ^ state;
 
   if (millis() - lastDebounceTime > debounceDelay) {
+    const uint8_t buttons[] = {BTN_UP, BTN_DOWN, BTN_OK, BTN_MENU};
+    for (uint8_t button : buttons) {
+      if ((changed & (1 << button)) && isPressed(state, button)) {
+        if (uiMode != UI_NORMAL) {
+          handleMenuButton(button);
+        } else if (button == BTN_MENU) {
+          enterConfigMenu();
+        } else if (button == BTN_UP) {
+          currentPage = currentPage == 0 ? PAGE_TOTAL - 1 : currentPage - 1;
+        } else if (button == BTN_DOWN) {
+          currentPage = (currentPage + 1) % PAGE_TOTAL;
+        } else if (button == BTN_OK) {
+          lastPoll = millis() - config.pollIntervalMs;
+        }
 
-    // UP
-    if ((changed & (1 << BTN_UP)) && isPressed(state, BTN_UP)) {
-      if (currentPage == 0) currentPage = PAGE_TOTAL - 1;
-      else currentPage--;
-      drawPage();
-      lastDebounceTime = millis();
-    }
-
-    // DOWN
-    if ((changed & (1 << BTN_DOWN)) && isPressed(state, BTN_DOWN)) {
-      currentPage++;
-      if (currentPage >= PAGE_TOTAL) currentPage = 0;
-      drawPage();
-      lastDebounceTime = millis();
-    }
-
-    // OK
-    if ((changed & (1 << BTN_OK)) && isPressed(state, BTN_OK)) {
-      // Jadwalkan polling segera; data layar tidak lagi diisi simulasi.
-      lastPoll = millis() - pollInterval;
-      lastDebounceTime = millis();
-    }
-
-    // MENU (optional, nanti bisa dipakai untuk masuk setting)
-    if ((changed & (1 << BTN_MENU)) && isPressed(state, BTN_MENU)) {
-      Serial.println("MENU pressed");
-      lastDebounceTime = millis();
+        drawPage();
+        lastDebounceTime = millis();
+        break;
+      }
     }
   }
 
   lastState = state;
 }
-
 void setup() {
   Serial.begin(115200);
+  loadConfig();
   analogReadResolution(12);
 
   pinMode(W5500_RST, OUTPUT);
@@ -601,13 +818,13 @@ void loop() {
   mb.task();
   handleButtons();
 
-  if (!mbBusy && millis() - lastPoll >= pollInterval) {
+  if (!mbBusy && millis() - lastPoll >= config.pollIntervalMs) {
     lastPoll = millis();
     drawPage();
 
     if (pollTarget == POLL_HSM) {
       // HSM: slave ID 9, holding register 40001-40012 (offset 0-11).
-      if (mb.readHreg(HSM_SLAVE_ID, HSM_START_ADDR, regData, NUM_REGS, cbRead)) {
+      if (mb.readHreg(config.hsmSlaveId, HSM_START_ADDR, regData, NUM_REGS, cbRead)) {
         mbBusy = true;
         pollTarget = POLL_ULTRASONIC;
       } else {
@@ -615,7 +832,7 @@ void loop() {
       }
     } else {
       // Ultrasonic: slave ID 1, holding register address 257, scaling /10 cm.
-      if (mb.readHreg(ULTRASONIC_SLAVE_ID, ULTRASONIC_ADDR,
+      if (mb.readHreg(config.ultrasonicSlaveId, config.ultrasonicAddress,
                       &ultrasonicReg, 1, cbUltrasonic)) {
         mbBusy = true;
         pollTarget = POLL_HSM;
