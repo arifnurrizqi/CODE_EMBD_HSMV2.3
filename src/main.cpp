@@ -73,7 +73,7 @@ ModbusRTU mb;
 HardwareSerial RS485Serial(2);
 
 const uint8_t HSM_SLAVE_ID = 9;
-const uint16_t HSM_START_ADDR = 1;   // offset 0 = 40001
+const uint16_t HSM_START_ADDR = 0;   // offset 0 = 40001
 enum SlaveRegister : uint8_t {
   REG_SAMPLE_FLOW = 0, REG_USAGE_DELTA, REG_SAMPLE_DELTA,
   REG_USAGE_TOTAL_HI, REG_USAGE_TOTAL_LO, REG_PH, REG_TURBIDITY,
@@ -382,14 +382,14 @@ void drawSensorPage() {
 
   sprintf(buf, "Pulse use : %u", usagePulseDelta);
   lcd.drawStr(2, 32, buf);
-
-  sprintf(buf, "Pulse smp : %u", samplePulseDelta);
-  lcd.drawStr(2, 42, buf);
-
+  
   sprintf(buf, "Total use : %lu", (unsigned long)usagePulseTotal);
   lcd.drawStr(2, 52, buf);
 
-  sprintf(buf, "pH/Turb   : %.2f/%.1f", phValue, turbidity);
+  sprintf(buf, "pH (0-14) : %.2f", phValue);
+  lcd.drawStr(2, 42, buf);
+  
+  sprintf(buf, "Turbid    : %.2f NTU", phValue, turbidity);
   lcd.drawStr(2, 62, buf);
 }
 
