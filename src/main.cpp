@@ -443,10 +443,10 @@ void drawSensorPage() {
   lcd.drawStr(2, 32, buf);
   
   sprintf(buf, "Total use : %lu", (unsigned long)usagePulseTotal);
-  lcd.drawStr(2, 52, buf);
+  lcd.drawStr(2, 42, buf);
 
   sprintf(buf, "pH (0-14) : %.2f", phValue);
-  lcd.drawStr(2, 42, buf);
+  lcd.drawStr(2, 52, buf);
   
   sprintf(buf, "Turbid    : %.2f NTU", phValue, turbidity);
   lcd.drawStr(2, 62, buf);
@@ -630,7 +630,7 @@ void drawConfigMenu() {
     formatMenuItem(item, buf, sizeof(buf));
 
     if (item == selectedMenuItem) {
-      lcd.drawBox(1, y, 126, 9);
+      lcd.drawBox(1, y, 118, 9);
       lcd.setDrawColor(0);
       lcd.drawStr(4, y + 7, buf);
       lcd.setDrawColor(1);
@@ -638,6 +638,20 @@ void drawConfigMenu() {
       lcd.drawStr(4, y + 7, buf);
     }
   }
+
+  // Scrollbar: ukuran dan posisi thumb mengikuti bagian daftar yang terlihat.
+  constexpr uint8_t SCROLL_Y = 12;
+  constexpr uint8_t SCROLL_H = 40;
+  const uint8_t thumbHeight = max(6, (SCROLL_H * VISIBLE_ITEMS) / MENU_ITEM_COUNT);
+  const uint8_t maxFirstVisible = MENU_ITEM_COUNT - VISIBLE_ITEMS;
+  const uint8_t thumbTravel = SCROLL_H - thumbHeight - 2;
+  const uint8_t thumbY = SCROLL_Y + 1 +
+                         (maxFirstVisible > 0
+                            ? (thumbTravel * firstVisible) / maxFirstVisible
+                            : 0);
+
+  lcd.drawFrame(121, SCROLL_Y, 6, SCROLL_H);
+  lcd.drawBox(122, thumbY, 4, thumbHeight);
 
   lcd.drawHLine(0, 53, 128);
   if (menuIdConflict) {
