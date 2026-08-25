@@ -50,6 +50,7 @@ void ethernetTask();
 void checkInternet();
 const char* getLanStatus();
 const char* getInternetStatus();
+const char* getHsmStatus();
 void printStatus();
 
 
@@ -205,7 +206,8 @@ enum PageMenu {
   PAGE_HOME = 0,
   PAGE_SENSOR,
   PAGE_ULTRASONIC,
-  PAGE_ALARM,
+  PAGE_ALARM_1,
+  PAGE_ALARM_2,
   PAGE_VOLTAGE,
   PAGE_COMM,
   PAGE_SYSTEM,
@@ -385,14 +387,14 @@ int getTotalAlarm() {
 
 
 void drawHeader(const char* title) {
-  lcd.setFont(u8g2_font_6x10_tf);
+  lcd.setFont(u8g2_font_5x7_tf);
 
   // Header background (hitam)
   lcd.drawBox(0, 0, 128, 12);
 
   // Title (putih)
   lcd.setDrawColor(0);
-  lcd.drawStr(2, 10, title);
+  lcd.drawStr(2, 9, title);
 
   // ===== PAGE INFO =====
   char pageInfo[16];
@@ -423,20 +425,20 @@ void drawHeader(const char* title) {
 void drawFooter() {
   lcd.drawLine(0, 54, 127, 54);
   lcd.setFont(u8g2_font_5x7_tf);
-
-  lcd.drawStr(0, 63, "OK:RFSH UP/DN:MOVE");
-
-  int totalAlarm = getTotalAlarm();
+  lcd.drawStr(0, 63, "UP/DN:MOVE");
 
   char buf[12];
-  if (totalAlarm == 0) {
-    sprintf(buf, "   ALM:--");
+  const char* hsmComm = getHsmStatus();
+  if (strcmp(hsmComm, "TIMEOUT") == 0 || strcmp(hsmComm, "STALE") == 0) {
+    snprintf(buf, sizeof(buf), "ALRM COUNT:COM");
   } else {
-    sprintf(buf, "   ALM:%d", totalAlarm);
+    int totalAlarm = getTotalAlarm();
+    if (totalAlarm == 0) snprintf(buf, sizeof(buf), "ALM:--");
+    else snprintf(buf, sizeof(buf), "ALRM COUNT:%d", totalAlarm);
   }
 
-  // tampilkan di kanan bawah
-  lcd.drawStr(85, 63, buf);
+  int textWidth = lcd.getStrWidth(buf);
+  lcd.drawStr(126 - textWidth, 63, buf);
 }
 
 const char* getDataStatus(bool hasData, bool attempted, bool connected,
@@ -462,14 +464,14 @@ const char* getErrorText(uint16_t code) {
     case 0: return "NO ERROR";
     case 1: return "NO FLOW";
     case 2: return "LEVEL RANGE";
-    case 3: return "PH DISCONNECT";
+    case 3: return "PH DC";
     case 4: return "PH RANGE";
     case 5: return "TURB ERROR";
-    case 6: return "ADC FAILURE";
+    case 6: return "ADC STATUS";
     case 7: return "SUPPLY LOW";
     case 8: return "SUPPLY HIGH";
     case 9: return "RS485 ERROR";
-    case 10: return "SENSOR TIMEOUT";
+    case 10: return "SENSOR TO";
     default: return "UNKNOWN";
   }
 }
@@ -494,7 +496,7 @@ void drawHomePage() {
 
 void drawSensorPage() {
   char buf[32];
-  drawHeader("DATA RAW");
+  drawHeader("DATA SENSOR RAW");
   lcd.setFont(u8g2_font_5x7_tf);
   snprintf(buf, sizeof(buf), "Flow smp  : %.2f L/m", flowRateSample); lcd.drawStr(2, 22, buf);
   snprintf(buf, sizeof(buf), "Delta smp : %u puls", samplePulseDelta); lcd.drawStr(2, 32, buf);
@@ -505,7 +507,7 @@ void drawSensorPage() {
 
 void drawUltrasonicPage() {
   char buf[32];
-  drawHeader("ULTRASONIC");
+  drawHeader("ULTRASONIC (US)");
   lcd.setFont(u8g2_font_5x7_tf);
 
   if (ultrasonicHasData) {
@@ -525,15 +527,27 @@ void drawUltrasonicPage() {
   lcd.drawStr(2, 62, buf);
 }
 
-void drawAlarmPage() {
+void drawErrorCodeRow(uint8_t row, uint8_t code) {
   char buf[32];
-  drawHeader("STATUS ALARM");
+  const char* state = hsmHasData ? (errorDetail == code ? "ACTIVE" : "NORMAL") : "NO DATA";
+  snprintf(buf, sizeof(buf), "%02u %-12s: %s", code, getErrorText(code), state);
+  lcd.drawStr(2, 22 + row * 10, buf);
+}
+
+void drawAlarmPage1() {
+  drawHeader("ALARM CODE 1-5");
   lcd.setFont(u8g2_font_5x7_tf);
-  snprintf(buf, sizeof(buf), "Flow use : %s", alarmFlowUsage ? "ERROR" : "NORMAL"); lcd.drawStr(2, 22, buf);
-  snprintf(buf, sizeof(buf), "Flow smp : %s", alarmFlowSample ? "ERROR" : "NORMAL"); lcd.drawStr(2, 32, buf);
-  snprintf(buf, sizeof(buf), "pH/Turb  : %s/%s", alarmPh ? "ERR" : "OK", alarmTurbidity ? "ERR" : "OK"); lcd.drawStr(2, 42, buf);
-  snprintf(buf, sizeof(buf), "Supply   : %s", alarmSupply ? "ERROR" : "NORMAL"); lcd.drawStr(2, 52, buf);
-  snprintf(buf, sizeof(buf), "Err %02u  : %s", errorDetail, getErrorText(errorDetail)); lcd.drawStr(2, 62, buf);
+  for (uint8_t code = 1; code <= 5; code++) {
+    drawErrorCodeRow(code - 1, code);
+  }
+}
+
+void drawAlarmPage2() {
+  drawHeader("ALARM CODE 6-10");
+  lcd.setFont(u8g2_font_5x7_tf);
+  for (uint8_t code = 6; code <= 10; code++) {
+    drawErrorCodeRow(code - 6, code);
+  }
 }
 
 void drawVoltagePage() {
@@ -555,12 +569,12 @@ void drawCommPage() {
   char buf[32];
   drawHeader("KOMUNIKASI");
   lcd.setFont(u8g2_font_5x7_tf);
-  snprintf(buf, sizeof(buf), "HSM ID %02u : %s", config.hsmSlaveId, getHsmStatus()); lcd.drawStr(2, 22, buf);
-  snprintf(buf, sizeof(buf), "US  ID %02u : %s", config.ultrasonicSlaveId, getUltrasonicStatus()); lcd.drawStr(2, 32, buf);
-  snprintf(buf, sizeof(buf), "LAN       : %s", getLanStatus()); lcd.drawStr(2, 42, buf);
-  snprintf(buf, sizeof(buf), "Internet  : %s", getInternetStatus()); lcd.drawStr(2, 52, buf);
-  snprintf(buf, sizeof(buf), "IP  : %u.%u.%u.%u", Ethernet.localIP()[0], Ethernet.localIP()[1], Ethernet.localIP()[2], Ethernet.localIP()[3]);
-  lcd.drawStr(2, 62, ethernetReady ? buf : "IP: ---.---.---.---");
+  snprintf(buf, sizeof(buf), "HSM ID %02u  : %s", config.hsmSlaveId, getHsmStatus()); lcd.drawStr(2, 22, buf);
+  snprintf(buf, sizeof(buf), "US  ID %02u  : %s", config.ultrasonicSlaveId, getUltrasonicStatus()); lcd.drawStr(2, 32, buf);
+  snprintf(buf, sizeof(buf), "LAN STATUS : %s", getLanStatus()); lcd.drawStr(2, 42, buf);
+  snprintf(buf, sizeof(buf), "Internet   : %s", getInternetStatus()); lcd.drawStr(2, 52, buf);
+  snprintf(buf, sizeof(buf), "IP Addr : %u.%u.%u.%u", Ethernet.localIP()[0], Ethernet.localIP()[1], Ethernet.localIP()[2], Ethernet.localIP()[3]);
+  lcd.drawStr(2, 62, ethernetReady ? buf : "IP Addr : ---.---.---.---");
 }
 
 void drawSystemPage() {
@@ -569,7 +583,7 @@ void drawSystemPage() {
   drawHeader("INFO SISTEM");
   lcd.setFont(u8g2_font_5x7_tf);
 
-  lcd.drawStr(2, 22, "Device : Water Analyzer");
+  lcd.drawStr(2, 22, "Device : IoT Water Monit.");
   lcd.drawStr(2, 32, "NAME   : HYDROFLOW V2.3");
   lcd.drawStr(2, 42, "BY     : ARNUR TECH");
   lcd.drawStr(2, 52, "FW Ver : v1.0");
@@ -672,7 +686,7 @@ void drawConfigMenu() {
   const uint8_t maxFirstVisible = MENU_ITEM_COUNT - VISIBLE_ITEMS;
   const uint8_t thumbTravel = SCROLL_H - thumbHeight - 2;
   const uint8_t thumbY = SCROLL_Y + 1 +
-                         (maxFirstVisible > 0
+                        (maxFirstVisible > 0
                             ? (thumbTravel * firstVisible) / maxFirstVisible
                             : 0);
 
@@ -775,8 +789,11 @@ void drawPage() {
     case PAGE_ULTRASONIC:
       drawUltrasonicPage();
       break;
-    case PAGE_ALARM:
-      drawAlarmPage();
+    case PAGE_ALARM_1:
+      drawAlarmPage1();
+      break;
+    case PAGE_ALARM_2:
+      drawAlarmPage2();
       break;
     case PAGE_VOLTAGE:
       drawVoltagePage();
