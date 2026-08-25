@@ -280,7 +280,7 @@ bool alarmFlowSample = false;
 // bool lanStatus = true;
 
 // int serverStatus = -65;
-unsigned long uptimeSec = 0;
+unsigned long uptimeHour = 0;
 
 unsigned long lastVoltageRead = 0;
 const uint32_t VOLTAGE_READ_INTERVAL = 1000;
@@ -369,7 +369,7 @@ void readBoardVoltage(){
   vin_5v  = 0.941 * (vout_5v * (R4 + R5) / R5) + 0.716;
 
   float vout_vcc = analogRead(PIN_VCC) * (3.3 / 4095.0);
-  vin_vcc  = 0.829 * (vout_vcc * (R6 + R7) / R7) + 3.19;
+  vin_vcc  = 0.841 * (vout_vcc * (R6 + R7) / R7) + 3.19;
 
 }
 // =========================
@@ -602,7 +602,7 @@ void drawSystemPage() {
   lcd.drawStr(2, 42, "BY     : ARNUR TECH");
   lcd.drawStr(2, 52, "FW Ver : v1.0");
 
-  snprintf(buf, sizeof(buf), "Uptime : %lu s", uptimeSec);
+  snprintf(buf, sizeof(buf), "Uptime : %lu Hours", uptimeHour);
   lcd.drawStr(2, 62, buf);
 }
 
@@ -926,7 +926,7 @@ void loop() {
   startupTask();
   voltageTask();
   autoPageTask();
-  uptimeSec = millis() / 1000UL;
+  uptimeHour = (millis() / 1000UL) / 3600;
   ethernetTask();
 
   mb.task();
