@@ -4,7 +4,9 @@
 #include <ModbusRTU.h>
 #include <SPI.h>
 #include <Ethernet.h>
+#include <EthernetUdp.h>
 #include <Preferences.h>
+#include <RTClib.h>
 
 // ==========================
 // KONFIGURASI MODBUS RS485
@@ -15,6 +17,7 @@
 
 byte mac[6];
 EthernetClient client;
+EthernetUDP ntpUdp;
 
 enum LanStatus {
   LAN_INIT,
@@ -57,6 +60,9 @@ void attemptDhcp();
 void startupTask();
 void voltageTask();
 void autoPageTask();
+void initRtc();
+void rtcTask();
+void ntpTask();
 void ethernetTask();
 void checkInternet();
 const char* getLanStatus();
@@ -232,6 +238,7 @@ enum PageMenu {
   PAGE_ALARM_2,
   PAGE_VOLTAGE,
   PAGE_COMM,
+  PAGE_RTC,
   PAGE_SYSTEM,
   PAGE_TOTAL
 };
@@ -294,6 +301,38 @@ unsigned long uptimeHour = 0;
 
 unsigned long lastVoltageRead = 0;
 const uint32_t VOLTAGE_READ_INTERVAL = 1000;
+
+// =========================
+// RTC DS3231 (I2C 0x68)
+// =========================
+RTC_DS3231 rtc;
+DateTime rtcNow;
+bool rtcReady = false;
+bool rtcTimeValid = false;
+bool rtcAdjustedAfterPowerLoss = false;
+bool rtcSyncedFromNtp = false;
+float rtcTemperatureC = 0.0f;
+unsigned long lastRtcRead = 0;
+unsigned long lastRtcInitAttempt = 0;
+const uint32_t RTC_READ_INTERVAL = 1000;
+const uint32_t RTC_RETRY_INTERVAL = 10000;
+
+// NTP disimpan ke DS3231 sebagai waktu lokal WIB (UTC+7).
+enum NtpState : uint8_t { NTP_IDLE, NTP_WAIT_RESPONSE };
+NtpState ntpState = NTP_IDLE;
+const char NTP_SERVER[] = "pool.ntp.org";
+const uint16_t NTP_LOCAL_PORT = 2390;
+const uint32_t NTP_PACKET_SIZE = 48;
+const uint32_t NTP_UNIX_OFFSET = 2208988800UL;
+const int32_t LOCAL_UTC_OFFSET_SECONDS = 7L * 3600L;
+const uint32_t NTP_RESPONSE_TIMEOUT = 3000;
+const uint32_t NTP_RETRY_INTERVAL = 60000;
+const uint32_t NTP_SYNC_INTERVAL = 6UL * 60UL * 60UL * 1000UL;
+byte ntpPacket[NTP_PACKET_SIZE];
+bool ntpUdpStarted = false;
+unsigned long ntpRequestStarted = 0;
+unsigned long lastNtpAttempt = 0;
+unsigned long lastNtpSync = 0;
 
 enum StartupState : uint8_t { START_RESET_LOW, START_RESET_WAIT, START_READY };
 StartupState startupState = START_RESET_LOW;
@@ -616,6 +655,35 @@ void drawSystemPage() {
   lcd.drawStr(2, 62, buf);
 }
 
+void drawRtcPage() {
+  char buf[32];
+  drawHeader("RTC DS3231");
+  lcd.setFont(u8g2_font_5x7_tf);
+
+  if (rtcReady && rtcTimeValid) {
+    snprintf(buf, sizeof(buf), "Date    : %04u-%02u-%02u",
+             rtcNow.year(), rtcNow.month(), rtcNow.day());
+    lcd.drawStr(2, 22, buf);
+    snprintf(buf, sizeof(buf), "Time    : %02u:%02u:%02u",
+             rtcNow.hour(), rtcNow.minute(), rtcNow.second());
+    lcd.drawStr(2, 32, buf);
+    snprintf(buf, sizeof(buf), "Temp    : %.2f C", rtcTemperatureC);
+    lcd.drawStr(2, 42, buf);
+  } else {
+    lcd.drawStr(2, 22, "Date    : ---- -- --");
+    lcd.drawStr(2, 32, "Time    : --:--:--");
+    lcd.drawStr(2, 42, "Temp    : --.-- C");
+  }
+
+  if (!rtcReady) snprintf(buf, sizeof(buf), "Status  : NOT FOUND");
+  else if (!rtcTimeValid) snprintf(buf, sizeof(buf), "Status  : TIME INVALID");
+  else if (rtcSyncedFromNtp) snprintf(buf, sizeof(buf), "Status  : NTP SYNC");
+  else if (rtcAdjustedAfterPowerLoss) snprintf(buf, sizeof(buf), "Status  : TIME RESET");
+  else snprintf(buf, sizeof(buf), "Status : OK");
+  lcd.drawStr(2, 52, buf);
+  lcd.drawStr(2, 62, "I2C Addr: 0x68");
+}
+
 const char* getMenuLabel(uint8_t item) {
   switch (item) {
     case MENU_HSM_ID: return "HSM ID";
@@ -839,6 +907,9 @@ void drawPage() {
     case PAGE_COMM:
       drawCommPage();
       break;
+    case PAGE_RTC:
+      drawRtcPage();
+      break;
     case PAGE_SYSTEM:
       drawSystemPage();
       break;
@@ -916,6 +987,122 @@ void autoPageTask() {
   currentPage = (currentPage + 1) % PAGE_TOTAL;
   drawPage();
 }
+void initRtc() {
+  lastRtcInitAttempt = millis();
+  rtcReady = rtc.begin();
+
+  if (!rtcReady) {
+    rtcTimeValid = false;
+    Serial.println("[RTC] DS3231 tidak terdeteksi pada alamat 0x68.");
+    return;
+  }
+
+  if (rtc.lostPower()) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    rtcAdjustedAfterPowerLoss = true;
+    Serial.println("[RTC] Lost power terdeteksi; waktu diisi dari waktu kompilasi.");
+  }
+
+  rtcNow = rtc.now();
+  rtcTimeValid = rtcNow.isValid();
+  rtcTemperatureC = rtc.getTemperature();
+  Serial.println(rtcTimeValid ? "[RTC] DS3231 siap." : "[RTC] Waktu DS3231 tidak valid.");
+}
+
+void rtcTask() {
+  unsigned long now = millis();
+
+  if (!rtcReady) {
+    if (now - lastRtcInitAttempt >= RTC_RETRY_INTERVAL) initRtc();
+    return;
+  }
+
+  if (now - lastRtcRead < RTC_READ_INTERVAL) return;
+  lastRtcRead = now;
+  rtcNow = rtc.now();
+  rtcTimeValid = rtcNow.isValid();
+  rtcTemperatureC = rtc.getTemperature();
+}
+
+void ntpTask() {
+  unsigned long now = millis();
+
+  if (!ethernetReady || Ethernet.linkStatus() != LinkON) {
+    if (ntpState == NTP_WAIT_RESPONSE) {
+      ntpUdp.stop();
+      ntpUdpStarted = false;
+      ntpState = NTP_IDLE;
+    }
+    return;
+  }
+
+  if (!ntpUdpStarted) {
+    ntpUdpStarted = ntpUdp.begin(NTP_LOCAL_PORT) == 1;
+    if (!ntpUdpStarted) return;
+  }
+
+  if (ntpState == NTP_WAIT_RESPONSE) {
+    int packetSize = ntpUdp.parsePacket();
+    if (packetSize >= (int)NTP_PACKET_SIZE) {
+      ntpUdp.read(ntpPacket, NTP_PACKET_SIZE);
+      uint32_t ntpSeconds = ((uint32_t)ntpPacket[40] << 24) |
+                            ((uint32_t)ntpPacket[41] << 16) |
+                            ((uint32_t)ntpPacket[42] << 8) |
+                            (uint32_t)ntpPacket[43];
+
+      if (ntpSeconds > NTP_UNIX_OFFSET) {
+        uint32_t localUnixTime = ntpSeconds - NTP_UNIX_OFFSET + LOCAL_UTC_OFFSET_SECONDS;
+        if (rtcReady) {
+          rtc.adjust(DateTime(localUnixTime));
+          rtcNow = rtc.now();
+          rtcTimeValid = rtcNow.isValid();
+          rtcSyncedFromNtp = rtcTimeValid;
+          rtcAdjustedAfterPowerLoss = false;
+          lastNtpSync = now;
+          Serial.printf("[NTP] RTC sinkron WIB: %04u-%02u-%02u %02u:%02u:%02u\n",
+                        rtcNow.year(), rtcNow.month(), rtcNow.day(),
+                        rtcNow.hour(), rtcNow.minute(), rtcNow.second());
+        }
+      } else {
+        Serial.println("[NTP] Respons tidak valid.");
+      }
+      ntpState = NTP_IDLE;
+      return;
+    }
+
+    if (now - ntpRequestStarted >= NTP_RESPONSE_TIMEOUT) {
+      ntpState = NTP_IDLE;
+      Serial.println("[NTP] Timeout, akan dicoba kembali.");
+    }
+    return;
+  }
+
+  uint32_t interval = rtcSyncedFromNtp ? NTP_SYNC_INTERVAL : NTP_RETRY_INTERVAL;
+  unsigned long reference = rtcSyncedFromNtp ? lastNtpSync : lastNtpAttempt;
+  if (now - reference < interval) return;
+
+  memset(ntpPacket, 0, NTP_PACKET_SIZE);
+  ntpPacket[0] = 0b11100011;
+  ntpPacket[1] = 0;
+  ntpPacket[2] = 6;
+  ntpPacket[3] = 0xEC;
+  ntpPacket[12] = 49;
+  ntpPacket[13] = 0x4E;
+  ntpPacket[14] = 49;
+  ntpPacket[15] = 52;
+
+  lastNtpAttempt = now;
+  digitalWrite(LCD_CS, LOW);
+  if (ntpUdp.beginPacket(NTP_SERVER, 123) &&
+      ntpUdp.write(ntpPacket, NTP_PACKET_SIZE) == NTP_PACKET_SIZE &&
+      ntpUdp.endPacket()) {
+    ntpRequestStarted = now;
+    ntpState = NTP_WAIT_RESPONSE;
+    Serial.println("[NTP] Request dikirim ke pool.ntp.org.");
+  } else {
+    Serial.println("[NTP] Gagal mengirim request/DNS gagal.");
+  }
+}
 void setup() {
   Serial.begin(115200);
   loadConfig();
@@ -937,6 +1124,7 @@ void setup() {
   mb.master();
 
   Wire.begin();
+  initRtc();
   randomSeed(analogRead(34));
   readBoardVoltage();
 }
@@ -944,9 +1132,11 @@ void setup() {
 void loop() {
   startupTask();
   voltageTask();
+  rtcTask();
   autoPageTask();
   uptimeHour = (millis() / 1000UL) / 3600;
   ethernetTask();
+  ntpTask();
 
   mb.task();
   handleButtons();
@@ -1028,6 +1218,7 @@ void attemptDhcp() {
   Serial.print("[LAN] Gateway : "); Serial.println(Ethernet.gatewayIP());
   Serial.print("[LAN] DNS     : "); Serial.println(Ethernet.dnsServerIP());
   lastInternetCheck = millis() - INTERNET_CHECK_INTERVAL;
+  if (!rtcSyncedFromNtp) lastNtpAttempt = millis() - NTP_RETRY_INTERVAL;
 }
 
 void ethernetTask() {
