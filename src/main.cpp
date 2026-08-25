@@ -46,6 +46,7 @@ const uint32_t INTERNET_CHECK_INTERVAL = 30000;
 
 void startupTask();
 void voltageTask();
+void autoPageTask();
 void ethernetTask();
 void checkInternet();
 const char* getLanStatus();
@@ -107,6 +108,9 @@ enum PollTarget : uint8_t {
 
 PollTarget pollTarget = POLL_HSM;
 unsigned long lastPoll = 0;
+unsigned long lastPageChange = 0;
+unsigned long manualPageHoldUntil = 0;
+const uint32_t MANUAL_PAGE_HOLD_MS = 20000;
 
 struct DeviceConfig {
   uint8_t hsmSlaveId = 9;
@@ -114,6 +118,8 @@ struct DeviceConfig {
   uint16_t ultrasonicAddress = 257;
   uint16_t ultrasonicScale = 10;
   uint32_t pollIntervalMs = 2000;
+  bool autoPageEnabled = true;
+  uint32_t autoPageIntervalMs = 5000;
 };
 
 Preferences preferences;
@@ -127,12 +133,15 @@ void loadConfig() {
   config.ultrasonicAddress = preferences.getUShort("us_addr", 257);
   config.ultrasonicScale = preferences.getUShort("us_scale", 10);
   config.pollIntervalMs = preferences.getULong("poll_ms", 2000);
+  config.autoPageEnabled = preferences.getBool("auto_page", true);
+  config.autoPageIntervalMs = preferences.getULong("page_ms", 5000);
   preferences.end();
 
   if (config.hsmSlaveId < 1 || config.hsmSlaveId > 247) config.hsmSlaveId = 9;
   if (config.ultrasonicSlaveId < 1 || config.ultrasonicSlaveId > 247) config.ultrasonicSlaveId = 1;
   if (config.ultrasonicScale < 1 || config.ultrasonicScale > 1000) config.ultrasonicScale = 10;
   if (config.pollIntervalMs < 250 || config.pollIntervalMs > 60000) config.pollIntervalMs = 2000;
+  if (config.autoPageIntervalMs < 2000 || config.autoPageIntervalMs > 60000) config.autoPageIntervalMs = 5000;
 }
 
 void saveConfig() {
@@ -143,9 +152,12 @@ void saveConfig() {
   preferences.putUShort("us_addr", config.ultrasonicAddress);
   preferences.putUShort("us_scale", config.ultrasonicScale);
   preferences.putULong("poll_ms", config.pollIntervalMs);
+  preferences.putBool("auto_page", config.autoPageEnabled);
+  preferences.putULong("page_ms", config.autoPageIntervalMs);
   preferences.end();
   pollTarget = POLL_HSM;
   lastPoll = millis() - config.pollIntervalMs;
+  lastPageChange = millis();
 }
 
 // Status polling
@@ -228,6 +240,8 @@ enum MenuItem : uint8_t {
   MENU_ULTRASONIC_ADDR,
   MENU_ULTRASONIC_SCALE,
   MENU_POLL_INTERVAL,
+  MENU_AUTO_PAGE,
+  MENU_AUTO_PAGE_INTERVAL,
   MENU_SAVE_EXIT,
   MENU_CANCEL,
   MENU_ITEM_COUNT
@@ -427,14 +441,14 @@ void drawFooter() {
   lcd.setFont(u8g2_font_5x7_tf);
   lcd.drawStr(0, 63, "UP/DN:MOVE");
 
-  char buf[12];
+  char buf[18];
   const char* hsmComm = getHsmStatus();
   if (strcmp(hsmComm, "TIMEOUT") == 0 || strcmp(hsmComm, "STALE") == 0) {
-    snprintf(buf, sizeof(buf), "ALRM COUNT:COM");
+    snprintf(buf, sizeof(buf), "ALM COUNT:COM");
   } else {
     int totalAlarm = getTotalAlarm();
-    if (totalAlarm == 0) snprintf(buf, sizeof(buf), "ALM:--");
-    else snprintf(buf, sizeof(buf), "ALRM COUNT:%d", totalAlarm);
+    if (totalAlarm == 0) snprintf(buf, sizeof(buf), "ALM COUNT:--");
+    else snprintf(buf, sizeof(buf), "ALM COUNT:%d", totalAlarm);
   }
 
   int textWidth = lcd.getStrWidth(buf);
@@ -599,6 +613,8 @@ const char* getMenuLabel(uint8_t item) {
     case MENU_ULTRASONIC_ADDR: return "US ADDR";
     case MENU_ULTRASONIC_SCALE: return "US SCALE";
     case MENU_POLL_INTERVAL: return "POLL MS";
+    case MENU_AUTO_PAGE: return "AUTO PAGE";
+    case MENU_AUTO_PAGE_INTERVAL: return "PAGE TIME";
     case MENU_SAVE_EXIT: return "SAVE & EXIT";
     case MENU_CANCEL: return "CANCEL";
     default: return "";
@@ -621,6 +637,12 @@ void formatMenuItem(uint8_t item, char* buf, size_t size) {
       break;
     case MENU_POLL_INTERVAL:
       snprintf(buf, size, "%s: %lu", getMenuLabel(item), (unsigned long)editConfig.pollIntervalMs);
+      break;
+    case MENU_AUTO_PAGE:
+      snprintf(buf, size, "%s: %s", getMenuLabel(item), editConfig.autoPageEnabled ? "ON" : "OFF");
+      break;
+    case MENU_AUTO_PAGE_INTERVAL:
+      snprintf(buf, size, "%s: %lu s", getMenuLabel(item), (unsigned long)(editConfig.autoPageIntervalMs / 1000));
       break;
     default:
       snprintf(buf, size, "%s", getMenuLabel(item));
@@ -719,6 +741,12 @@ void adjustMenuValue(int8_t direction) {
     case MENU_POLL_INTERVAL:
       editConfig.pollIntervalMs = constrain((int32_t)editConfig.pollIntervalMs + direction * 250L, 250L, 60000L);
       break;
+    case MENU_AUTO_PAGE:
+      editConfig.autoPageEnabled = !editConfig.autoPageEnabled;
+      break;
+    case MENU_AUTO_PAGE_INTERVAL:
+      editConfig.autoPageIntervalMs = constrain((int32_t)editConfig.autoPageIntervalMs + direction * 1000L, 2000L, 60000L);
+      break;
   }
 }
 
@@ -752,7 +780,7 @@ void handleMenuButton(uint8_t button) {
   } else if (button == BTN_DOWN) {
     selectedMenuItem = (selectedMenuItem + 1) % MENU_ITEM_COUNT;
   } else if (button == BTN_OK) {
-    if (selectedMenuItem <= MENU_POLL_INTERVAL) {
+    if (selectedMenuItem <= MENU_AUTO_PAGE_INTERVAL) {
       uiMode = UI_MENU_EDIT;
     } else if (selectedMenuItem == MENU_SAVE_EXIT) {
       if (editConfig.hsmSlaveId == editConfig.ultrasonicSlaveId) {
@@ -817,6 +845,8 @@ void handleButtons() {
     const uint8_t buttons[] = {BTN_UP, BTN_DOWN, BTN_OK, BTN_MENU};
     for (uint8_t button : buttons) {
       if ((changed & (1 << button)) && isPressed(state, button)) {
+        manualPageHoldUntil = millis() + MANUAL_PAGE_HOLD_MS;
+        lastPageChange = millis();
         if (uiMode != UI_NORMAL) {
           handleMenuButton(button);
         } else if (button == BTN_MENU) {
@@ -827,6 +857,7 @@ void handleButtons() {
           currentPage = (currentPage + 1) % PAGE_TOTAL;
         } else if (button == BTN_OK) {
           lastPoll = millis() - config.pollIntervalMs;
+  lastPageChange = millis();
         }
 
         drawPage();
@@ -862,6 +893,17 @@ void voltageTask() {
   lastVoltageRead = millis();
   readBoardVoltage();
 }
+void autoPageTask() {
+  if (!config.autoPageEnabled || uiMode != UI_NORMAL || !displayReady) return;
+
+  unsigned long now = millis();
+  if ((int32_t)(now - manualPageHoldUntil) < 0) return;
+  if (now - lastPageChange < config.autoPageIntervalMs) return;
+
+  lastPageChange = now;
+  currentPage = (currentPage + 1) % PAGE_TOTAL;
+  drawPage();
+}
 void setup() {
   Serial.begin(115200);
   loadConfig();
@@ -883,6 +925,7 @@ void setup() {
 void loop() {
   startupTask();
   voltageTask();
+  autoPageTask();
   uptimeSec = millis() / 1000UL;
   ethernetTask();
 
