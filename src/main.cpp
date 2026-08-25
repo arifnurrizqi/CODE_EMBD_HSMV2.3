@@ -11,38 +11,48 @@
 // ==========================
 #define W5500_CS   5
 #define W5500_RST  4
+#define LCD_CS     15
 
-byte mac[] = {0xDE,0xAD,0xBE,0xEF,0xFE,0x01};
-
+byte mac[6];
 EthernetClient client;
 
-enum LanStatus
-{
-    LAN_INIT,
-    LAN_NO_CABLE,
-    LAN_WAIT_DHCP,
-    LAN_CONNECTED,
-    LAN_DHCP_FAILED
+enum LanStatus {
+  LAN_INIT,
+  LAN_HW_NOT_FOUND,
+  LAN_NO_CABLE,
+  LAN_WAIT_DHCP,
+  LAN_CONNECTED,
+  LAN_DHCP_FAILED
 };
 
-enum InternetStatus
-{
-    NET_UNKNOWN,
-    NET_CONNECTED,
-    NET_DISCONNECTED
+enum InternetStatus {
+  NET_UNKNOWN,
+  NET_CHECKING,
+  NET_CONNECTED,
+  NET_DISCONNECTED
 };
 
 LanStatus lanStatus = LAN_INIT;
 InternetStatus internetStatus = NET_UNKNOWN;
-
 bool ethernetReady = false;
+bool ethernetHardwareDetected = false;
+uint8_t dhcpMaintenanceFailures = 0;
 
 unsigned long lastDHCPAttempt = 0;
 unsigned long lastInternetCheck = 0;
+unsigned long lastDhcpMaintain = 0;
 unsigned long lastPrint = 0;
 
-const uint32_t DHCP_RETRY_INTERVAL = 5000;
+const uint32_t DHCP_RETRY_INTERVAL = 10000;
+const uint32_t DHCP_MAINTAIN_INTERVAL = 1000;
 const uint32_t INTERNET_CHECK_INTERVAL = 30000;
+const uint32_t NETWORK_STATUS_PRINT_INTERVAL = 5000;
+const uint32_t DHCP_TIMEOUT = 5000;
+const uint32_t DHCP_RESPONSE_TIMEOUT = 1000;
+const uint16_t TCP_CONNECTION_TIMEOUT = 3000;
+
+void initMacAddress();
+void attemptDhcp();
 
 void startupTask();
 void voltageTask();
@@ -61,10 +71,10 @@ void printStatus();
 // =========================
 U8G2_ST7920_128X64_F_SW_SPI lcd(
   U8G2_R0,
-  18,   // clock
-  23,   // data
-  15,    // cs
-  4     // reset
+  27,   // clock
+  26,   // data
+  15,   // cs
+  U8X8_PIN_NONE
 );
 
 // ==========================
@@ -878,8 +888,10 @@ void startupTask() {
   } else if (startupState == START_RESET_WAIT && now - startupTimer >= 300) {
     SPI.begin(18, 19, 23, W5500_CS);
     Ethernet.init(W5500_CS);
+    client.setConnectionTimeout(TCP_CONNECTION_TIMEOUT);
     lanStatus = LAN_INIT;
     networkHardwareReady = true;
+    lastDHCPAttempt = millis() - DHCP_RETRY_INTERVAL;
 
     lcd.begin();
     displayReady = true;
@@ -908,6 +920,13 @@ void setup() {
   Serial.begin(115200);
   loadConfig();
   analogReadResolution(12);
+  initMacAddress();
+
+  // Pastikan kedua chip-select tidak aktif sejak boot.
+  pinMode(LCD_CS, OUTPUT);
+  digitalWrite(LCD_CS, LOW);      // ST7920 aktif-HIGH
+  pinMode(W5500_CS, OUTPUT);
+  digitalWrite(W5500_CS, HIGH);   // W5500 aktif-LOW
 
   pinMode(W5500_RST, OUTPUT);
   digitalWrite(W5500_RST, LOW);
@@ -956,142 +975,161 @@ void loop() {
     }
   }
 
-  if(ethernetReady)
-  {
-    Ethernet.maintain();
 
-    if(millis()-lastInternetCheck > INTERNET_CHECK_INTERVAL)
-    {
-      lastInternetCheck = millis();
-      checkInternet();
-    }
-  }
-
-  if(millis()-lastPrint > 1000)
+  if(millis()-lastPrint > NETWORK_STATUS_PRINT_INTERVAL)
   {
     lastPrint = millis();
     printStatus();
   }
 }
 
-void ethernetTask()
-{
-    if(!networkHardwareReady) return;
-    if(Ethernet.linkStatus()==LinkOFF)
-    {
+void initMacAddress() {
+  uint64_t efuseMac = ESP.getEfuseMac();
+  mac[0] = 0x02;
+  mac[1] = (uint8_t)(efuseMac >> 32);
+  mac[2] = (uint8_t)(efuseMac >> 24);
+  mac[3] = (uint8_t)(efuseMac >> 16);
+  mac[4] = (uint8_t)(efuseMac >> 8);
+  mac[5] = (uint8_t)efuseMac;
+
+  Serial.printf("Ethernet MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+void attemptDhcp() {
+  lanStatus = LAN_WAIT_DHCP;
+  internetStatus = NET_UNKNOWN;
+  ethernetReady = false;
+  digitalWrite(LCD_CS, LOW);
+
+  Serial.println("[LAN] Request DHCP...");
+  int dhcpResult = Ethernet.begin(mac, DHCP_TIMEOUT, DHCP_RESPONSE_TIMEOUT);
+  ethernetHardwareDetected = Ethernet.hardwareStatus() == EthernetW5500;
+
+  if (!ethernetHardwareDetected) {
+    lanStatus = LAN_HW_NOT_FOUND;
+    Serial.println("[LAN] W5500 NOT FOUND - periksa power, SPI, CS dan RST.");
+    return;
+  }
+
+  if (dhcpResult == 0) {
+    lanStatus = Ethernet.linkStatus() == LinkOFF ? LAN_NO_CABLE : LAN_DHCP_FAILED;
+    Serial.println(lanStatus == LAN_NO_CABLE
+                     ? "[LAN] Kabel tidak terhubung."
+                     : "[LAN] DHCP gagal, akan dicoba kembali.");
+    return;
+  }
+
+  ethernetReady = true;
+  dhcpMaintenanceFailures = 0;
+  lanStatus = LAN_CONNECTED;
+  Serial.println("[LAN] DHCP berhasil.");
+  Serial.print("[LAN] IP      : "); Serial.println(Ethernet.localIP());
+  Serial.print("[LAN] Gateway : "); Serial.println(Ethernet.gatewayIP());
+  Serial.print("[LAN] DNS     : "); Serial.println(Ethernet.dnsServerIP());
+  lastInternetCheck = millis() - INTERNET_CHECK_INTERVAL;
+}
+
+void ethernetTask() {
+  if (!networkHardwareReady) return;
+  unsigned long now = millis();
+
+  if (ethernetHardwareDetected && Ethernet.linkStatus() == LinkOFF) {
+    if (ethernetReady) Serial.println("[LAN] Kabel Ethernet terputus.");
+    ethernetReady = false;
+    lanStatus = LAN_NO_CABLE;
+    internetStatus = NET_UNKNOWN;
+  }
+
+  if (!ethernetReady) {
+    if (now - lastDHCPAttempt >= DHCP_RETRY_INTERVAL) {
+      lastDHCPAttempt = now;
+      attemptDhcp();
+    }
+    return;
+  }
+
+  lanStatus = LAN_CONNECTED;
+
+  if (now - lastDhcpMaintain >= DHCP_MAINTAIN_INTERVAL) {
+    lastDhcpMaintain = now;
+    int result = Ethernet.maintain();
+    if (result == 1 || result == 3) {
+      dhcpMaintenanceFailures++;
+      Serial.printf("[DHCP] Maintenance gagal (%u/3).\n", dhcpMaintenanceFailures);
+      if (dhcpMaintenanceFailures >= 3) {
         ethernetReady = false;
-        lanStatus = LAN_NO_CABLE;
-        internetStatus = NET_UNKNOWN;
-        return;
-    }
-
-    if(ethernetReady)
-    {
-        lanStatus = LAN_CONNECTED;
-        return;
-    }
-
-    lanStatus = LAN_WAIT_DHCP;
-
-    if(millis()-lastDHCPAttempt < DHCP_RETRY_INTERVAL)
-        return;
-
-    lastDHCPAttempt = millis();
-
-    Serial.println("Request DHCP...");
-
-    if(Ethernet.begin(mac))
-    {
-        ethernetReady = true;
-        lanStatus = LAN_CONNECTED;
-
-        Serial.println("DHCP Success");
-        Serial.print("IP : ");
-        Serial.println(Ethernet.localIP());
-
-        checkInternet();
-    }
-    else
-    {
         lanStatus = LAN_DHCP_FAILED;
+        internetStatus = NET_UNKNOWN;
+        lastDHCPAttempt = now - DHCP_RETRY_INTERVAL;
+      }
+    } else if (result == 2 || result == 4) {
+      dhcpMaintenanceFailures = 0;
+      Serial.println("[DHCP] Lease berhasil diperbarui.");
     }
-}
+  }
 
-//======================================================
-
-void checkInternet()
-{
-    if(client.connect("google.com",80))
-    {
-        internetStatus = NET_CONNECTED;
-        client.stop();
-    }
-    else
-    {
-        internetStatus = NET_DISCONNECTED;
-    }
-}
-
-const char* getLanStatus()
-{
-  switch(lanStatus)
-  {
-    case LAN_INIT:
-      return "INIT";
-
-    case LAN_NO_CABLE:
-      return "NO CABLE";
-
-    case LAN_WAIT_DHCP:
-      return "WAIT DHCP";
-
-    case LAN_CONNECTED:
-      return "CONNECTED";
-
-    case LAN_DHCP_FAILED:
-      return "DHCP FAILED";
-
-    default:
-      return "UNKNOWN";
+  if (ethernetReady && now - lastInternetCheck >= INTERNET_CHECK_INTERVAL) {
+    lastInternetCheck = now;
+    checkInternet();
   }
 }
 
-const char* getInternetStatus()
-{
-  switch(internetStatus)
-  {
-    case NET_UNKNOWN:
-      return "UNKNOWN";
+void checkInternet() {
+  if (!ethernetReady || Ethernet.linkStatus() != LinkON) {
+    internetStatus = NET_UNKNOWN;
+    return;
+  }
 
-    case NET_CONNECTED:
-      return "CONNECTED";
+  internetStatus = NET_CHECKING;
+  client.stop();
+  digitalWrite(LCD_CS, LOW);
 
-    case NET_DISCONNECTED:
-      return "DISCONNECTED";
-
-    default:
-      return "UNKNOWN";
+  if (client.connect("google.com", 80)) {
+    client.println("HEAD / HTTP/1.1");
+    client.println("Host: google.com");
+    client.println("Connection: close");
+    client.println();
+    internetStatus = NET_CONNECTED;
+    client.stop();
+    Serial.println("[NET] Internet connected.");
+  } else {
+    internetStatus = NET_DISCONNECTED;
+    Serial.println("[NET] Internet disconnected/DNS failed.");
   }
 }
 
-void printStatus()
-{
-    Serial.println("--------------------------");
+const char* getLanStatus() {
+  switch (lanStatus) {
+    case LAN_INIT: return "INIT";
+    case LAN_HW_NOT_FOUND: return "HW NOT FOUND";
+    case LAN_NO_CABLE: return "NO CABLE";
+    case LAN_WAIT_DHCP: return "WAIT DHCP";
+    case LAN_CONNECTED: return "CONNECTED";
+    case LAN_DHCP_FAILED: return "DHCP FAILED";
+    default: return "UNKNOWN";
+  }
+}
 
-    Serial.print("LAN      : ");
-    Serial.println(getLanStatus());
+const char* getInternetStatus() {
+  switch (internetStatus) {
+    case NET_UNKNOWN: return "UNKNOWN";
+    case NET_CHECKING: return "CHECKING";
+    case NET_CONNECTED: return "CONNECTED";
+    case NET_DISCONNECTED: return "DISCONNECTED";
+    default: return "UNKNOWN";
+  }
+}
 
-    Serial.print("Internet : ");
-    Serial.println(getInternetStatus());
-
-    if(ethernetReady)
-    {
-        Serial.print("IP       : ");
-        Serial.println(Ethernet.localIP());
-
-        Serial.print("Gateway  : ");
-        Serial.println(Ethernet.gatewayIP());
-    }
-
-    Serial.println("--------------------------");
+void printStatus() {
+  Serial.println("--------------------------");
+  Serial.print("Hardware : ");
+  Serial.println(ethernetHardwareDetected ? "W5500" : "NOT READY");
+  Serial.print("LAN      : "); Serial.println(getLanStatus());
+  Serial.print("Internet : "); Serial.println(getInternetStatus());
+  if (ethernetReady) {
+    Serial.print("IP       : "); Serial.println(Ethernet.localIP());
+    Serial.print("Gateway  : "); Serial.println(Ethernet.gatewayIP());
+  }
+  Serial.println("--------------------------");
 }
