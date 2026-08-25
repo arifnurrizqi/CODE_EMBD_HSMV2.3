@@ -44,6 +44,8 @@ unsigned long lastPrint = 0;
 const uint32_t DHCP_RETRY_INTERVAL = 5000;
 const uint32_t INTERNET_CHECK_INTERVAL = 30000;
 
+void startupTask();
+void voltageTask();
 void ethernetTask();
 void checkInternet();
 const char* getLanStatus();
@@ -93,6 +95,9 @@ uint16_t regData[NUM_REGS];
 uint16_t ultrasonicReg = 250;
 float ultrasonicDistanceCm = 25.0f;
 bool ultrasonicStatus = false;
+bool ultrasonicHasData = false;
+bool ultrasonicAttempted = false;
+unsigned long lastUltrasonicSuccess = 0;
 
 enum PollTarget : uint8_t {
   POLL_HSM,
@@ -250,10 +255,25 @@ bool alarmTurbidity = false;
 bool alarmFlow = false;
 bool alarmSupply = false;
 bool rs485Status = false;
+bool hsmHasData = false;
+bool hsmAttempted = false;
+unsigned long lastHsmSuccess = 0;
+
+bool alarmFlowUsage = false;
+bool alarmFlowSample = false;
 // bool lanStatus = true;
 
 // int serverStatus = -65;
 unsigned long uptimeSec = 0;
+
+unsigned long lastVoltageRead = 0;
+const uint32_t VOLTAGE_READ_INTERVAL = 1000;
+
+enum StartupState : uint8_t { START_RESET_LOW, START_RESET_WAIT, START_READY };
+StartupState startupState = START_RESET_LOW;
+unsigned long startupTimer = 0;
+bool displayReady = false;
+bool networkHardwareReady = false;
 
 // ==========================
 // CALLBACK HASIL BACA
@@ -276,15 +296,21 @@ bool cbRead(Modbus::ResultCode event, uint16_t transactionId, void* data) {
     sensorStatus = regData[REG_SENSOR_STATUS];
     errorDetail = regData[REG_ERROR_DETAIL];
 
-    alarmFlow = !(sensorStatus & SENSOR_FLOW_USAGE_OK) || !(sensorStatus & SENSOR_FLOW_SAMPLE_OK);
+    alarmFlowUsage = !(sensorStatus & SENSOR_FLOW_USAGE_OK);
+    alarmFlowSample = !(sensorStatus & SENSOR_FLOW_SAMPLE_OK);
+    alarmFlow = alarmFlowUsage || alarmFlowSample;
     alarmPh = !(sensorStatus & SENSOR_PH_OK);
     alarmTurbidity = !(sensorStatus & SENSOR_TURBIDITY_OK);
     alarmSupply = !(sensorStatus & SENSOR_VCC_OK) || !(sensorStatus & SENSOR_5V_OK);
 
     rs485Status = true;
+    hsmHasData = true;
+    hsmAttempted = true;
+    lastHsmSuccess = millis();
 
   } else {
     rs485Status = false;
+    hsmAttempted = true;
     Serial.print("Gagal baca Modbus. ResultCode: ");
     Serial.println((int)event);
   }
@@ -301,6 +327,9 @@ bool cbUltrasonic(Modbus::ResultCode event, uint16_t transactionId, void* data) 
   if (event == Modbus::EX_SUCCESS) {
     ultrasonicDistanceCm = ultrasonicReg / (float)config.ultrasonicScale;
     ultrasonicStatus = true;
+    ultrasonicHasData = true;
+    ultrasonicAttempted = true;
+    lastUltrasonicSuccess = millis();
     Serial.println("===== DATA ULTRASONIC =====");
     Serial.print("Raw      : ");
     Serial.println(ultrasonicReg);
@@ -309,6 +338,7 @@ bool cbUltrasonic(Modbus::ResultCode event, uint16_t transactionId, void* data) 
     Serial.println(" cm");
   } else {
     ultrasonicStatus = false;
+    ultrasonicAttempted = true;
     Serial.print("Gagal baca ultrasonic. ResultCode: ");
     Serial.println((int)event);
   }
@@ -325,7 +355,6 @@ void readBoardVoltage(){
   float vout_vcc = analogRead(PIN_VCC) * (3.3 / 4095.0);
   vin_vcc  = 0.829 * (vout_vcc * (R6 + R7) / R7) + 3.19;
 
-  delay(1000);
 }
 // =========================
 // Debounce tombol
@@ -351,7 +380,7 @@ bool buttonPressed(uint8_t pin, bool &lastState) {
 }
 
 int getTotalAlarm() {
-  return alarmPh + alarmTurbidity + alarmFlow + alarmSupply;
+  return alarmPh + alarmTurbidity + alarmFlowUsage + alarmFlowSample + alarmSupply;
 }
 
 
@@ -410,131 +439,128 @@ void drawFooter() {
   lcd.drawStr(85, 63, buf);
 }
 
+const char* getDataStatus(bool hasData, bool attempted, bool connected,
+                          unsigned long lastSuccess) {
+  if (!hasData) return attempted ? "TIMEOUT" : "WAITING";
+  if (!connected) return "TIMEOUT";
+  uint32_t staleWindow = config.pollIntervalMs * 4U;
+  uint32_t staleLimit = staleWindow > 5000U ? staleWindow : 5000U;
+  return millis() - lastSuccess > staleLimit ? "STALE" : "CONNECTED";
+}
+
+const char* getHsmStatus() {
+  return getDataStatus(hsmHasData, hsmAttempted, rs485Status, lastHsmSuccess);
+}
+
+const char* getUltrasonicStatus() {
+  return getDataStatus(ultrasonicHasData, ultrasonicAttempted,
+                       ultrasonicStatus, lastUltrasonicSuccess);
+}
+
+const char* getErrorText(uint16_t code) {
+  switch (code) {
+    case 0: return "NO ERROR";
+    case 1: return "NO FLOW";
+    case 2: return "LEVEL RANGE";
+    case 3: return "PH DISCONNECT";
+    case 4: return "PH RANGE";
+    case 5: return "TURB ERROR";
+    case 6: return "ADC FAILURE";
+    case 7: return "SUPPLY LOW";
+    case 8: return "SUPPLY HIGH";
+    case 9: return "RS485 ERROR";
+    case 10: return "SENSOR TIMEOUT";
+    default: return "UNKNOWN";
+  }
+}
 void drawHomePage() {
   char buf[32];
-
   drawHeader("HYDROFLOW V2.3");
-
-  lcd.setFont(u8g2_font_6x10_tf);
-
-  sprintf(buf, "Flow   : %.2f L/m", flowRateSample);
-  lcd.drawStr(2, 22, buf);
-
-  sprintf(buf, "pH     : %.2f", phValue);
-  lcd.drawStr(2, 34, buf);
-
-  sprintf(buf, "Turbid : %.1f NTU", turbidity);
-  lcd.drawStr(2, 46, buf);
-  
+  lcd.setFont(u8g2_font_5x7_tf);
+  if (hsmHasData) {
+    snprintf(buf, sizeof(buf), "Flow  : %.2f L/min", flowRateSample); lcd.drawStr(2, 20, buf);
+    snprintf(buf, sizeof(buf), "pH    : %.2f", phValue); lcd.drawStr(2, 30, buf);
+    snprintf(buf, sizeof(buf), "Turb  : %.1f NTU", turbidity); lcd.drawStr(2, 40, buf);
+  } else {
+    lcd.drawStr(2, 20, "Flow  : --.-- L/min");
+    lcd.drawStr(2, 30, "pH    : --.--");
+    lcd.drawStr(2, 40, "Turb  : --.- NTU");
+  }
+  if (ultrasonicHasData) snprintf(buf, sizeof(buf), "Level : %.1f cm", ultrasonicDistanceCm);
+  else snprintf(buf, sizeof(buf), "Level : --.- cm");
+  lcd.drawStr(2, 50, buf);
   drawFooter();
 }
 
 void drawSensorPage() {
   char buf[32];
-
-  drawHeader("DATA SENSOR");
-
+  drawHeader("DATA RAW");
   lcd.setFont(u8g2_font_5x7_tf);
-
-  sprintf(buf, "Flow rate : %.2f L/m", flowRateSample);
-  lcd.drawStr(2, 22, buf);
-
-  sprintf(buf, "Pulse use : %u", usagePulseDelta);
-  lcd.drawStr(2, 32, buf);
-  
-  sprintf(buf, "Total use : %lu", (unsigned long)usagePulseTotal);
-  lcd.drawStr(2, 42, buf);
-
-  sprintf(buf, "pH (0-14) : %.2f", phValue);
-  lcd.drawStr(2, 52, buf);
-  
-  sprintf(buf, "Turbid    : %.2f NTU", phValue, turbidity);
-  lcd.drawStr(2, 62, buf);
+  snprintf(buf, sizeof(buf), "Flow smp  : %.2f L/m", flowRateSample); lcd.drawStr(2, 22, buf);
+  snprintf(buf, sizeof(buf), "Delta smp : %u puls", samplePulseDelta); lcd.drawStr(2, 32, buf);
+  snprintf(buf, sizeof(buf), "Delta use : %u puls", usagePulseDelta); lcd.drawStr(2, 42, buf);
+  snprintf(buf, sizeof(buf), "Total     : %lu puls", (unsigned long)usagePulseTotal); lcd.drawStr(2, 52, buf);
+  snprintf(buf, sizeof(buf), "pH/Turb   : %.2f/%.1f", phValue, turbidity); lcd.drawStr(2, 62, buf);
 }
 
 void drawUltrasonicPage() {
   char buf[32];
-
   drawHeader("ULTRASONIC");
-  lcd.setFont(u8g2_font_6x10_tf);
+  lcd.setFont(u8g2_font_5x7_tf);
 
-  sprintf(buf, "Distance: %.1f cm", ultrasonicDistanceCm);
-  lcd.drawStr(2, 25, buf);
-
-  sprintf(buf, "Raw     : %u", ultrasonicReg);
-  lcd.drawStr(2, 38, buf);
-
-  sprintf(buf, "ID:%u Reg:%u", config.ultrasonicSlaveId, config.ultrasonicAddress);
-  lcd.drawStr(2, 50, buf);
-
-  drawFooter();
+  if (ultrasonicHasData) {
+    snprintf(buf, sizeof(buf), "Distance : %.1f cm", ultrasonicDistanceCm);
+    lcd.drawStr(2, 22, buf);
+    snprintf(buf, sizeof(buf), "Raw      : %u", ultrasonicReg);
+    lcd.drawStr(2, 32, buf);
+  } else {
+    lcd.drawStr(2, 22, "Distance : --.- cm");
+    lcd.drawStr(2, 32, "Raw      : -----");
+  }
+  snprintf(buf, sizeof(buf), "Status   : %s", getUltrasonicStatus());
+  lcd.drawStr(2, 42, buf);
+  snprintf(buf, sizeof(buf), "Slave ID : %u", config.ultrasonicSlaveId);
+  lcd.drawStr(2, 52, buf);
+  snprintf(buf, sizeof(buf), "Register : %u", config.ultrasonicAddress);
+  lcd.drawStr(2, 62, buf);
 }
+
 void drawAlarmPage() {
+  char buf[32];
   drawHeader("STATUS ALARM");
   lcd.setFont(u8g2_font_5x7_tf);
-
-  lcd.drawStr(2, 22, "Flow      :");
-  lcd.drawStr(62, 22, alarmFlow ? "ERROR" : "NORMAL");
-
-  lcd.drawStr(2, 32, "pH Error  :");
-  lcd.drawStr(62, 32, alarmPh ? "ACTIVE" : "NORMAL");
-
-  lcd.drawStr(2, 42, "Turbidity :");
-  lcd.drawStr(62, 42, alarmTurbidity ? "ACTIVE" : "NORMAL");
-
-  lcd.drawStr(2, 52, "Supply    :");
-  lcd.drawStr(62, 52, alarmSupply ? "ERROR" : "NORMAL");
-
-
-  char buf[22];
-  sprintf(buf, "Sys:%u Error:%u", systemStatus, errorDetail);
-  lcd.drawStr(2, 62, buf);
+  snprintf(buf, sizeof(buf), "Flow use : %s", alarmFlowUsage ? "ERROR" : "NORMAL"); lcd.drawStr(2, 22, buf);
+  snprintf(buf, sizeof(buf), "Flow smp : %s", alarmFlowSample ? "ERROR" : "NORMAL"); lcd.drawStr(2, 32, buf);
+  snprintf(buf, sizeof(buf), "pH/Turb  : %s/%s", alarmPh ? "ERR" : "OK", alarmTurbidity ? "ERR" : "OK"); lcd.drawStr(2, 42, buf);
+  snprintf(buf, sizeof(buf), "Supply   : %s", alarmSupply ? "ERROR" : "NORMAL"); lcd.drawStr(2, 52, buf);
+  snprintf(buf, sizeof(buf), "Err %02u  : %s", errorDetail, getErrorText(errorDetail)); lcd.drawStr(2, 62, buf);
 }
 
-void drawVoltagePage(){
-  readBoardVoltage();
+void drawVoltagePage() {
   char buf[32];
-
   drawHeader("VOLTAGE SYSTEM");
   lcd.setFont(u8g2_font_5x7_tf);
-
-  sprintf(buf, "VCC Mstr  : %.2f V", vin_vcc);
-  lcd.drawStr(2, 22, buf);
-
-  sprintf(buf, "VCC Slv   : %.2f V", slaveVcc);
+  snprintf(buf, sizeof(buf), "VCC Mstr  : %.2f V", vin_vcc); lcd.drawStr(2, 22, buf);
+  if (hsmHasData) snprintf(buf, sizeof(buf), "VCC Slv   : %.2f V", slaveVcc);
+  else snprintf(buf, sizeof(buf), "VCC Slv   : --.-- V");
   lcd.drawStr(2, 32, buf);
-
-  sprintf(buf, "5V Mstr   : %.2f V", vin_5v);
-  lcd.drawStr(2, 42, buf);
-    
-  sprintf(buf, "5V Slv    : %.2f V", slave5V);
+  snprintf(buf, sizeof(buf), "5V Mstr   : %.2f V", vin_5v); lcd.drawStr(2, 42, buf);
+  if (hsmHasData) snprintf(buf, sizeof(buf), "5V Slv    : %.2f V", slave5V);
+  else snprintf(buf, sizeof(buf), "5V Slv    : --.-- V");
   lcd.drawStr(2, 52, buf);
-
-  sprintf(buf, "3.3V Mstr : %.2f V", vin_3v3);
-  lcd.drawStr(2, 62, buf);
-
+  snprintf(buf, sizeof(buf), "3.3V Mstr : %.2f V", vin_3v3); lcd.drawStr(2, 62, buf);
 }
 
 void drawCommPage() {
   char buf[32];
-
   drawHeader("KOMUNIKASI");
   lcd.setFont(u8g2_font_5x7_tf);
-
-  sprintf(buf, "HSM/US ID  : %u/%u", config.hsmSlaveId, config.ultrasonicSlaveId);
-  lcd.drawStr(2, 22, buf);
-
-  sprintf(buf, "RS485      : %s", rs485Status ? "CONNECTED" : "TIMEOUT");
-  lcd.drawStr(2, 32, buf);
-
-  sprintf(buf, "LAN RJ45   : %s", getLanStatus());
-  lcd.drawStr(2, 42, buf);
-
-  sprintf(buf, "INTERNET   : %s", getInternetStatus());
-  lcd.drawStr(2, 52, buf);
-
-  sprintf(buf, "Status     : %u/%u", systemStatus, errorDetail);
-  lcd.drawStr(2, 62, buf);
+  snprintf(buf, sizeof(buf), "HSM ID %02u : %s", config.hsmSlaveId, getHsmStatus()); lcd.drawStr(2, 22, buf);
+  snprintf(buf, sizeof(buf), "US  ID %02u : %s", config.ultrasonicSlaveId, getUltrasonicStatus()); lcd.drawStr(2, 32, buf);
+  snprintf(buf, sizeof(buf), "LAN       : %s", getLanStatus()); lcd.drawStr(2, 42, buf);
+  snprintf(buf, sizeof(buf), "Internet  : %s", getInternetStatus()); lcd.drawStr(2, 52, buf);
+  snprintf(buf, sizeof(buf), "IP  : %u.%u.%u.%u", Ethernet.localIP()[0], Ethernet.localIP()[1], Ethernet.localIP()[2], Ethernet.localIP()[3]);
+  lcd.drawStr(2, 62, ethernetReady ? buf : "IP: ---.---.---.---");
 }
 
 void drawSystemPage() {
@@ -548,7 +574,7 @@ void drawSystemPage() {
   lcd.drawStr(2, 42, "BY     : ARNUR TECH");
   lcd.drawStr(2, 52, "FW Ver : v1.0");
 
-  sprintf(buf, "Uptime : %lu s", uptimeSec);
+  snprintf(buf, sizeof(buf), "Uptime : %lu s", uptimeSec);
   lcd.drawStr(2, 62, buf);
 }
 
@@ -730,6 +756,7 @@ void handleMenuButton(uint8_t button) {
   }
 }
 void drawPage() {
+  if (!displayReady) return;
   lcd.clearBuffer();
 
   if (uiMode != UI_NORMAL) {
@@ -794,39 +821,52 @@ void handleButtons() {
 
   lastState = state;
 }
+void startupTask() {
+  unsigned long now = millis();
+  if (startupState == START_RESET_LOW && now - startupTimer >= 100) {
+    digitalWrite(W5500_RST, HIGH);
+    startupTimer = now;
+    startupState = START_RESET_WAIT;
+  } else if (startupState == START_RESET_WAIT && now - startupTimer >= 300) {
+    SPI.begin(18, 19, 23, W5500_CS);
+    Ethernet.init(W5500_CS);
+    lanStatus = LAN_INIT;
+    networkHardwareReady = true;
+
+    lcd.begin();
+    displayReady = true;
+    startupState = START_READY;
+    drawPage();
+  }
+}
+
+void voltageTask() {
+  if (millis() - lastVoltageRead < VOLTAGE_READ_INTERVAL) return;
+  lastVoltageRead = millis();
+  readBoardVoltage();
+}
 void setup() {
   Serial.begin(115200);
   loadConfig();
   analogReadResolution(12);
 
   pinMode(W5500_RST, OUTPUT);
-
   digitalWrite(W5500_RST, LOW);
-  delay(100);
-  digitalWrite(W5500_RST, HIGH);
-  delay(300);
+  startupTimer = millis();
 
-  SPI.begin(18,19,23,W5500_CS);
-
-  Ethernet.init(W5500_CS);
-
-  lanStatus = LAN_INIT;
-
-  // Serial2 untuk RS485
   RS485Serial.begin(9600, SERIAL_8N1, RXD2, TXD2);
-  // Master Modbus tanpa DE/RE
   mb.begin(&RS485Serial);
   mb.master();
 
-  lcd.begin();
   Wire.begin();
-
   randomSeed(analogRead(34));
-
-  drawPage();
+  readBoardVoltage();
 }
 
 void loop() {
+  startupTask();
+  voltageTask();
+  uptimeSec = millis() / 1000UL;
   ethernetTask();
 
   mb.task();
@@ -876,6 +916,7 @@ void loop() {
 
 void ethernetTask()
 {
+    if(!networkHardwareReady) return;
     if(Ethernet.linkStatus()==LinkOFF)
     {
         ethernetReady = false;
