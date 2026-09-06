@@ -17,6 +17,7 @@
 
 byte mac[6];
 EthernetClient client;
+EthernetClient telemetryClient;
 EthernetUDP ntpUdp;
 
 enum LanStatus {
@@ -54,6 +55,31 @@ const uint32_t DHCP_TIMEOUT = 5000;
 const uint32_t DHCP_RESPONSE_TIMEOUT = 1000;
 const uint16_t TCP_CONNECTION_TIMEOUT = 3000;
 
+// ==========================
+// HTTP TELEMETRY
+// ==========================
+const IPAddress TELEMETRY_SERVER(192, 168, 8, 7);
+const uint16_t TELEMETRY_PORT = 8000;
+const char TELEMETRY_PATH[] = "/api/v1/telemetry";
+const char DEVICE_SN[] = "DEMO-DEVICE-001";
+const uint32_t TELEMETRY_SEND_INTERVAL = 30000;
+const uint32_t TELEMETRY_RETRY_INTERVAL = 10000;
+const uint32_t TELEMETRY_RESPONSE_TIMEOUT = 5000;
+
+enum TelemetryState : uint8_t { TELEMETRY_IDLE, TELEMETRY_WAIT_RESPONSE };
+TelemetryState telemetryState = TELEMETRY_IDLE;
+unsigned long lastTelemetryAttempt = 0;
+unsigned long telemetryRequestStarted = 0;
+bool telemetryEverAttempted = false;
+bool telemetryLastSuccess = false;
+char telemetryStatusLine[48];
+uint8_t telemetryStatusLength = 0;
+uint32_t pendingDeltaPulse = 0;
+uint32_t sentDeltaPulse = 0;
+uint32_t previousUsagePulseTotal = 0;
+bool usagePulseBaselineReady = false;
+uint32_t commandId = 1;
+
 void initMacAddress();
 void attemptDhcp();
 
@@ -63,6 +89,7 @@ void autoPageTask();
 void initRtc();
 void rtcTask();
 void ntpTask();
+void telemetryTask();
 void ethernetTask();
 void checkInternet();
 const char* getLanStatus();
@@ -352,7 +379,17 @@ bool cbRead(Modbus::ResultCode event, uint16_t transactionId, void* data) {
     flowRateSample = regData[REG_SAMPLE_FLOW] / 100.0f;
     usagePulseDelta = regData[REG_USAGE_DELTA];
     samplePulseDelta = regData[REG_SAMPLE_DELTA];
-    usagePulseTotal = ((uint32_t)regData[REG_USAGE_TOTAL_HI] << 16) | regData[REG_USAGE_TOTAL_LO];
+    uint32_t newUsagePulseTotal = ((uint32_t)regData[REG_USAGE_TOTAL_HI] << 16) | regData[REG_USAGE_TOTAL_LO];
+    if (usagePulseBaselineReady) {
+      uint32_t pulseDifference = newUsagePulseTotal >= previousUsagePulseTotal
+                                   ? newUsagePulseTotal - previousUsagePulseTotal
+                                   : newUsagePulseTotal;
+      pendingDeltaPulse += pulseDifference;
+    } else {
+      usagePulseBaselineReady = true;
+    }
+    previousUsagePulseTotal = newUsagePulseTotal;
+    usagePulseTotal = newUsagePulseTotal;
     phValue = regData[REG_PH] / 100.0f;
     turbidity = regData[REG_TURBIDITY] / 10.0f;
     slaveVcc = regData[REG_VCC] / 100.0f;
@@ -1103,11 +1140,123 @@ void ntpTask() {
     Serial.println("[NTP] Gagal mengirim request/DNS gagal.");
   }
 }
+
+void finishTelemetryRequest(bool success, int httpCode) {
+  telemetryClient.stop();
+  telemetryState = TELEMETRY_IDLE;
+  telemetryLastSuccess = success;
+  telemetryStatusLength = 0;
+
+  if (success) {
+    pendingDeltaPulse = pendingDeltaPulse >= sentDeltaPulse
+                          ? pendingDeltaPulse - sentDeltaPulse
+                          : 0;
+    Serial.printf("[HTTP] Telemetry diterima, status %d. Delta tersisa: %lu\n",
+                  httpCode, (unsigned long)pendingDeltaPulse);
+  } else if (httpCode > 0) {
+    Serial.printf("[HTTP] Telemetry ditolak, status %d.\n", httpCode);
+  } else {
+    Serial.println("[HTTP] Pengiriman telemetry gagal.");
+  }
+}
+
+void telemetryTask() {
+  unsigned long now = millis();
+
+  if (!ethernetReady || Ethernet.linkStatus() != LinkON) {
+    if (telemetryState == TELEMETRY_WAIT_RESPONSE) finishTelemetryRequest(false, 0);
+    return;
+  }
+
+  if (telemetryState == TELEMETRY_WAIT_RESPONSE) {
+    while (telemetryClient.available()) {
+      char c = telemetryClient.read();
+      if (c == '\n') {
+        telemetryStatusLine[telemetryStatusLength] = '\0';
+        int httpCode = 0;
+        if (sscanf(telemetryStatusLine, "HTTP/%*s %d", &httpCode) == 1) {
+          finishTelemetryRequest(httpCode >= 200 && httpCode < 300, httpCode);
+          return;
+        }
+        telemetryStatusLength = 0;
+      } else if (c != '\r' && telemetryStatusLength < sizeof(telemetryStatusLine) - 1) {
+        telemetryStatusLine[telemetryStatusLength++] = c;
+      }
+    }
+
+    if (now - telemetryRequestStarted >= TELEMETRY_RESPONSE_TIMEOUT ||
+        (!telemetryClient.connected() && !telemetryClient.available())) {
+      finishTelemetryRequest(false, 0);
+    }
+    return;
+  }
+
+  uint32_t interval = telemetryLastSuccess
+                        ? TELEMETRY_SEND_INTERVAL
+                        : TELEMETRY_RETRY_INTERVAL;
+  if (telemetryEverAttempted && now - lastTelemetryAttempt < interval) return;
+
+  bool hsmDataReady = strcmp(getHsmStatus(), "CONNECTED") == 0;
+  bool ultrasonicDataReady = strcmp(getUltrasonicStatus(), "CONNECTED") == 0;
+  if (!hsmDataReady || !ultrasonicDataReady || !rtcReady || !rtcTimeValid) return;
+
+  char recordedAt[32];
+  snprintf(recordedAt, sizeof(recordedAt), "%04u-%02u-%02uT%02u:%02u:%02u+07:00",
+           rtcNow.year(), rtcNow.month(), rtcNow.day(),
+           rtcNow.hour(), rtcNow.minute(), rtcNow.second());
+
+  sentDeltaPulse = pendingDeltaPulse;
+  char payload[512];
+  int payloadLength = snprintf(
+    payload, sizeof(payload),
+    "{\"device_sn\":\"%s\",\"ph\":%.2f,\"turbidity\":%.1f,"
+    "\"delta_pulse\":%lu,\"sample_flow\":%.2f,\"level_cm\":%.1f,"
+    "\"device_voltage_mcu\":%.2f,\"device_voltage_5v\":%.2f,"
+    "\"device_voltage_input\":%.2f,\"signal_strength\":-1,"
+    "\"valve_state\":false,\"command_id\":%lu,\"recorded_at\":\"%s\"}",
+    DEVICE_SN, phValue, turbidity, (unsigned long)sentDeltaPulse,
+    flowRateSample, ultrasonicDistanceCm, vin_3v3, vin_5v, vin_vcc,
+    (unsigned long)commandId, recordedAt
+  );
+
+  lastTelemetryAttempt = now;
+  telemetryEverAttempted = true;
+  if (payloadLength <= 0 || payloadLength >= (int)sizeof(payload)) {
+    Serial.println("[HTTP] Payload terlalu panjang.");
+    return;
+  }
+
+  digitalWrite(LCD_CS, LOW);
+  telemetryClient.stop();
+  if (!telemetryClient.connect(TELEMETRY_SERVER, TELEMETRY_PORT)) {
+    Serial.println("[HTTP] Tidak dapat terhubung ke 192.168.8.7:8000.");
+    return;
+  }
+
+  telemetryClient.print("POST ");
+  telemetryClient.print(TELEMETRY_PATH);
+  telemetryClient.println(" HTTP/1.1");
+  telemetryClient.println("Host: 192.168.8.7:8000");
+  telemetryClient.println("Content-Type: application/json");
+  telemetryClient.println("Accept: application/json");
+  telemetryClient.println("Connection: close");
+  telemetryClient.print("Content-Length: ");
+  telemetryClient.println(payloadLength);
+  telemetryClient.println();
+  telemetryClient.write((const uint8_t*)payload, payloadLength);
+
+  telemetryStatusLength = 0;
+  telemetryRequestStarted = now;
+  telemetryState = TELEMETRY_WAIT_RESPONSE;
+  Serial.print("[HTTP] POST telemetry: ");
+  Serial.println(payload);
+}
 void setup() {
   Serial.begin(115200);
   loadConfig();
   analogReadResolution(12);
   initMacAddress();
+  telemetryClient.setConnectionTimeout(TCP_CONNECTION_TIMEOUT);
 
   // Pastikan kedua chip-select tidak aktif sejak boot.
   pinMode(LCD_CS, OUTPUT);
@@ -1137,6 +1286,7 @@ void loop() {
   uptimeHour = (millis() / 1000UL) / 3600;
   ethernetTask();
   ntpTask();
+  telemetryTask();
 
   mb.task();
   handleButtons();
