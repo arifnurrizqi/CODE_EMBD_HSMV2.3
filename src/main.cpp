@@ -275,6 +275,7 @@ enum UiMode : uint8_t {
 };
 
 enum MenuItem : uint8_t {
+  MENU_WEB_SETUP,
   MENU_HSM_ID,
   MENU_ULTRASONIC_ID,
   MENU_ULTRASONIC_ADDR,
@@ -282,14 +283,13 @@ enum MenuItem : uint8_t {
   MENU_POLL_INTERVAL,
   MENU_AUTO_PAGE,
   MENU_AUTO_PAGE_INTERVAL,
-  MENU_WEB_SETUP,
   MENU_SAVE_EXIT,
   MENU_CANCEL,
   MENU_ITEM_COUNT
 };
 
 UiMode uiMode = UI_NORMAL;
-uint8_t selectedMenuItem = MENU_HSM_ID;
+uint8_t selectedMenuItem = MENU_WEB_SETUP;
 bool menuIdConflict = false;
 
 // =========================
@@ -872,7 +872,7 @@ void adjustMenuValue(int8_t direction) {
 
 void enterConfigMenu() {
   editConfig = config;
-  selectedMenuItem = MENU_HSM_ID;
+  selectedMenuItem = MENU_WEB_SETUP;
   menuIdConflict = false;
   uiMode = UI_MENU_LIST;
 }
@@ -900,7 +900,7 @@ void handleMenuButton(uint8_t button) {
   } else if (button == BTN_DOWN) {
     selectedMenuItem = (selectedMenuItem + 1) % MENU_ITEM_COUNT;
   } else if (button == BTN_OK) {
-    if (selectedMenuItem <= MENU_AUTO_PAGE_INTERVAL) {
+    if (selectedMenuItem >= MENU_HSM_ID && selectedMenuItem <= MENU_AUTO_PAGE_INTERVAL) {
       uiMode = UI_MENU_EDIT;
     } else if (selectedMenuItem == MENU_WEB_SETUP) {
       startWebSetup(DEVICE_SN);
@@ -954,7 +954,10 @@ void drawPage() {
   if (webSetupActive) {
     lcd.setDrawColor(1);
     lcd.setFont(u8g2_font_5x7_tf);
+    lcd.drawBox(0, 0, 128, 12);
+    lcd.setDrawColor(0);
     lcd.drawStr(2, 9, "WEB SETUP - HOTSPOT");
+    lcd.setDrawColor(1);
     lcd.drawStr(2, 21, setupSsid);
     char line[26];
     snprintf(line, sizeof(line), "Password: %s", setupPassword);

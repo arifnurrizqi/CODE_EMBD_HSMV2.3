@@ -25,6 +25,32 @@ struct NetworkConfig {
 NetworkConfig networkConfig;
 NetworkConfig pendingNetworkConfig;
 WebServer setupServer(80);
+static const char SETUP_SUCCESS_HTML[] PROGMEM = R"HTML(<!doctype html>
+<html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Konfigurasi tersimpan - HIDROFLOW</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#eef3f6;color:#183040;font:16px system-ui,sans-serif}
+main{width:100%;max-width:460px;background:#fff;border:1px solid #d8e4e8;border-radius:18px;padding:32px;box-shadow:0 12px 36px #18304012}
+.brand{font-size:12px;letter-spacing:2px;color:#096e76;font-weight:700}.icon{display:grid;place-items:center;width:56px;height:56px;margin:24px 0 16px;border-radius:50%;background:#e0f5eb;color:#167448;font-size:30px}
+h1{font-size:25px;margin:0 0 12px}p{line-height:1.6;margin:12px 0}.note{padding:14px;background:#eef7f8;border-radius:10px;font-size:14px}footer{margin-top:24px;font-size:13px;color:#526b77}
+</style></head><body style="margin:0;padding:24px;background:#eef3f6;color:#183040;font:16px system-ui,sans-serif"><main style="width:100%;max-width:460px;margin:24px auto;background:#fff;border:1px solid #d8e4e8;border-radius:18px;padding:32px;box-shadow:0 12px 36px #18304012">
+<div class="brand">HIDROFLOW V2.3</div><div class="icon" aria-hidden="true">&#10003;</div>
+<h1>Konfigurasi tersimpan</h1>
+<p>Pengaturan berhasil disimpan dan tetap tersedia setelah perangkat dimatikan.</p>
+<p class="note">Hotspot akan ditutup dalam sekitar 2 detik. Pengaturan jaringan diterapkan setelah pengiriman HTTP yang sedang berjalan selesai.</p>
+<p>Kamu boleh menutup halaman ini dan menghubungkan HP kembali ke jaringan biasa.</p>
+<footer>Pengaturan MQTT hanya disimpan; koneksi MQTT belum aktif.<br>by ARNUR TECH</footer>
+</main></body></html>)HTML";
+
+void sendSetupError(int status, const char* message) {
+  String page = F("<!doctype html><html lang='id'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Web Setup - HIDROFLOW</title></head><body style='margin:0;padding:24px;background:#eef3f6;color:#183040;font:16px system-ui,sans-serif'><main style='box-sizing:border-box;max-width:460px;margin:24px auto;padding:32px;background:white;border:1px solid #d8e4e8;border-radius:18px'><p style='color:#096e76;font-size:12px;letter-spacing:2px'>HIDROFLOW V2.3</p><h1 style='font-size:24px;color:#a53c26'>Konfigurasi belum disimpan</h1><p style='line-height:1.6'>");
+  // Messages are firmware literals, never unescaped form input.
+  page += message;
+  page += F("</p><a href='/' style='display:inline-block;margin-top:16px;padding:12px 18px;background:#096e76;color:white;text-decoration:none;border-radius:8px'>Kembali ke konfigurasi</a><p style='font-size:13px;color:#526b77'>by ARNUR TECH</p></main></body></html>");
+  setupServer.sendHeader("Cache-Control", "no-store");
+  setupServer.send(status, "text/html; charset=utf-8", page);
+}
 bool webSetupActive = false;
 bool setupRoutesRegistered = false;
 bool networkApplyPending = false;
@@ -143,6 +169,7 @@ void startWebSetup(const char* deviceId) {
       "<br>HTTP terakhir: " + (!telemetryEverAttempted ? String("belum mengirim") : telemetryLastSuccess ? String("berhasil") : String("menunggu/gagal")) + "</p>";
     page += "<form method='post' action='/save'><input type='hidden' name='nonce' value='" + setupNonce + "'><fieldset><legend>HTTP telemetry</legend>";
     page += setupInput("Endpoint lengkap (http://)", "endpoint", networkConfig.endpoint, 191);
+    page += F("<p><small>Hanya mendukung <strong>HTTP (http://)</strong>. HTTPS (https://) belum didukung. Gunakan endpoint POST langsung tanpa redirect ke HTTPS.<br>Contoh: http://192.168.8.7:8000/api/v1/telemetry</small></p>");
     page += setupInput("Interval (15-3600 detik)", "interval", String(networkConfig.intervalSeconds), 4, "number");
     page += setupInput("Bearer token baru (kosong = tetap)", "token", "", 127, "password");
     page += "<label><input type='checkbox' name='clearToken' value='1'> Hapus token tersimpan</label></fieldset><fieldset><legend>Ethernet</legend><label>Mode<select name='dhcp'>";
@@ -162,13 +189,42 @@ void startWebSetup(const char* deviceId) {
     page += setupInput("Path WebSocket", "mqttPath", networkConfig.mqttPath, 95);
     page += setupInput("Username", "username", networkConfig.username, 63);
     page += setupInput("Password baru (kosong = tetap)", "password", "", 127, "password");
-    page += "<label><input type='checkbox' name='clearPassword' value='1'> Hapus password tersimpan</label><p>Topic: devices/" + htmlEscape(deviceId) + "/telemetry</p></fieldset><button>Simpan &amp; Terapkan</button><p>Hotspot ditutup setelah disimpan, atau 5 menit tanpa aktivitas. MENU pada LCD untuk keluar.</p></form></html>";
+    page += "<label><input type='checkbox' name='clearPassword' value='1'> Hapus password tersimpan</label><p>Topic: devices/" + htmlEscape(deviceId) + "/telemetry</p></fieldset><button>Simpan &amp; Terapkan</button><p>Hotspot ditutup setelah disimpan, atau 5 menit tanpa aktivitas. MENU pada LCD untuk keluar.</p></form><small>Web Setup UI 3</small>";
+    page += F(R"HTML(<script>
+const form=document.querySelector('form');
+form.addEventListener('submit',async function(event){
+  event.preventDefault();
+  const button=form.querySelector('button');
+  if(button.disabled)return;
+  button.disabled=true;button.textContent='Menyimpan...';
+  let error=document.getElementById('save-error');
+  if(!error){error=document.createElement('p');error.id='save-error';error.setAttribute('role','alert');error.style.color='#a53c26';form.appendChild(error);}
+  error.textContent='';
+  const body=new URLSearchParams(new FormData(form));body.set('response','json');
+  try{
+    const response=await fetch('/save',{method:'POST',body:body,cache:'no-store'});
+    if(!response.ok){
+      const html=await response.text();
+      const parsed=new DOMParser().parseFromString(html,'text/html');
+      error.textContent=parsed.querySelector('main p:nth-of-type(2)')?.textContent || 'Penyimpanan ditolak. Periksa konfigurasi dan coba kembali.';
+      button.disabled=false;button.textContent='Simpan & Terapkan';return;
+    }
+    const result=await response.json();
+    if(result.saved!==true)throw new Error('unconfirmed');
+    document.title='Konfigurasi tersimpan - HIDROFLOW';
+    document.body.innerHTML='<main style="max-width:460px;margin:40px auto;padding:28px;background:white;border:1px solid #d8e4e8;border-radius:18px;box-shadow:0 12px 36px #18304012"><p style="color:#096e76;font-size:12px;letter-spacing:2px">HIDROFLOW V2.3</p><div style="width:56px;height:56px;line-height:56px;text-align:center;border-radius:50%;background:#e0f5eb;color:#167448;font-size:30px">&#10003;</div><h1 style="font-size:25px">Konfigurasi tersimpan</h1><p style="line-height:1.6">Pengaturan berhasil disimpan dan tetap tersedia setelah perangkat dimatikan.</p><p style="padding:14px;background:#eef7f8;border-radius:10px;line-height:1.6">Hotspot akan ditutup. Kamu boleh menutup halaman ini dan menghubungkan HP kembali ke jaringan biasa.</p><p style="font-size:13px;color:#526b77">Pengaturan MQTT tersimpan; koneksi belum aktif.<br>by ARNUR TECH &middot; UI 3</p></main>';
+  }catch(e){
+    error.textContent='Konfirmasi penyimpanan belum diterima. Buka ulang Web Setup untuk memeriksa nilai tersimpan sebelum mencoba lagi.';
+    button.disabled=false;button.textContent='Simpan & Terapkan';
+  }
+});
+</script></html>)HTML");
     setupServer.sendHeader("Cache-Control", "no-store");
     setupServer.send(200, "text/html", page);
   });
   setupServer.on("/save", HTTP_POST, []() {
     if (setupCloseAt || setupServer.arg("nonce") != setupNonce) {
-      setupServer.send(403, "text/plain", "Sesi tidak valid. Buka ulang halaman."); return;
+      sendSetupError(403, "Sesi tidak valid atau penyimpanan sudah diproses. Buka ulang halaman konfigurasi."); return;
     }
     setupLastActivity = millis();
     NetworkConfig candidate = networkConfig;
@@ -212,15 +268,24 @@ void startWebSetup(const char* deviceId) {
     else if (setupServer.arg("token").length()) valid &= copy("token", candidate.token, sizeof(candidate.token));
     if (setupServer.hasArg("clearPassword")) candidate.password[0] = 0;
     else if (setupServer.arg("password").length()) valid &= copy("password", candidate.password, sizeof(candidate.password));
-    if (!valid) { setupServer.send(400, "text/plain", "Konfigurasi tidak valid. Periksa URL http://, interval, IP/subnet dan broker. Kembali untuk memperbaiki."); return; }
+    if (!valid) { sendSetupError(400, "Konfigurasi tidak valid. Periksa URL http:// (HTTPS belum didukung), interval, IP/subnet dan broker. Kembali untuk memperbaiki."); return; }
     Preferences p;
-    if (!p.begin("hydro-net", false)) { setupServer.send(500, "text/plain", "NVS tidak dapat dibuka."); return; }
+    if (!p.begin("hydro-net", false)) { sendSetupError(500, "Penyimpanan NVS tidak dapat dibuka. Silakan coba kembali."); return; }
     bool saved = p.putBytes("config", &candidate, sizeof(candidate)) == sizeof(candidate);
     p.end();
-    if (!saved) { setupServer.send(500, "text/plain", "Gagal menyimpan. Konfigurasi aktif tetap."); return; }
+    if (!saved) { sendSetupError(500, "Gagal menyimpan. Konfigurasi aktif tetap. Silakan coba kembali."); return; }
     pendingNetworkConfig = candidate;
-    setupServer.send(200, "text/html", "<meta name='viewport' content='width=device-width'><h2>Konfigurasi disimpan</h2><p>Pengaturan diterapkan dan hotspot ditutup dalam 2 detik. MQTT hanya disimpan untuk integrasi berikutnya.</p>");
+    setupServer.sendHeader("Cache-Control", "no-store");
+    if (setupServer.arg("response") == "json") {
+      setupServer.send(200, "application/json", "{\"saved\":true,\"ui\":3}");
+    } else {
+      setupServer.send_P(200, "text/html; charset=utf-8", SETUP_SUCCESS_HTML);
+    }
+    Serial.println("[SETUP] POST /save: 200, UI 3, NVS tersimpan.");
     setupCloseAt = millis() + 2000;
+  });
+  setupServer.on("/save", HTTP_GET, []() {
+    sendSetupError(405, "Penyimpanan harus melalui tombol Simpan &amp; Terapkan pada form, bukan membuka /save langsung.");
   });
   setupServer.onNotFound([]() { setupServer.send(404, "text/plain", "Buka http://192.168.4.1/"); });
   setupRoutesRegistered = true;
