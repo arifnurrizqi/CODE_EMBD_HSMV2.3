@@ -58,11 +58,7 @@ const uint16_t TCP_CONNECTION_TIMEOUT = 3000;
 // ==========================
 // HTTP TELEMETRY
 // ==========================
-const IPAddress TELEMETRY_SERVER(192, 168, 8, 7);
-const uint16_t TELEMETRY_PORT = 8000;
-const char TELEMETRY_PATH[] = "/api/v1/telemetry";
 const char DEVICE_SN[] = "DEMO-DEVICE-001";
-const uint32_t TELEMETRY_SEND_INTERVAL = 30000;
 const uint32_t TELEMETRY_RETRY_INTERVAL = 10000;
 const uint32_t TELEMETRY_RESPONSE_TIMEOUT = 5000;
 
@@ -286,6 +282,7 @@ enum MenuItem : uint8_t {
   MENU_POLL_INTERVAL,
   MENU_AUTO_PAGE,
   MENU_AUTO_PAGE_INTERVAL,
+  MENU_WEB_SETUP,
   MENU_SAVE_EXIT,
   MENU_CANCEL,
   MENU_ITEM_COUNT
@@ -366,6 +363,13 @@ StartupState startupState = START_RESET_LOW;
 unsigned long startupTimer = 0;
 bool displayReady = false;
 bool networkHardwareReady = false;
+bool bootScreenActive = true;
+unsigned long bootScreenStarted = 0;
+unsigned long lastBootFrame = 0;
+const uint32_t BOOT_SCREEN_DURATION_MS = 10000;
+const uint32_t BOOT_FRAME_INTERVAL_MS = 100;
+
+#include "web_setup.h"
 
 // ==========================
 // CALLBACK HASIL BACA
@@ -730,6 +734,7 @@ const char* getMenuLabel(uint8_t item) {
     case MENU_POLL_INTERVAL: return "POLL MS";
     case MENU_AUTO_PAGE: return "AUTO PAGE";
     case MENU_AUTO_PAGE_INTERVAL: return "PAGE TIME";
+    case MENU_WEB_SETUP: return "WEB SETUP";
     case MENU_SAVE_EXIT: return "SAVE & EXIT";
     case MENU_CANCEL: return "CANCEL";
     default: return "";
@@ -897,6 +902,8 @@ void handleMenuButton(uint8_t button) {
   } else if (button == BTN_OK) {
     if (selectedMenuItem <= MENU_AUTO_PAGE_INTERVAL) {
       uiMode = UI_MENU_EDIT;
+    } else if (selectedMenuItem == MENU_WEB_SETUP) {
+      startWebSetup(DEVICE_SN);
     } else if (selectedMenuItem == MENU_SAVE_EXIT) {
       if (editConfig.hsmSlaveId == editConfig.ultrasonicSlaveId) {
         menuIdConflict = true;
@@ -912,9 +919,56 @@ void handleMenuButton(uint8_t button) {
     }
   }
 }
+void drawBootScreen() {
+  lcd.setDrawColor(1);
+  lcd.setFont(u8g2_font_5x7_tf);
+  auto centered = [](const char* text, uint8_t y) {
+    lcd.drawStr((128 - lcd.getStrWidth(text)) / 2, y, text);
+  };
+  centered("HIDROFLOW V2.3", 12);
+  centered("IOT WATER MONITORING", 24);
+  centered("by ARNUR TECH", 35);
+
+  // Timed splash progress, not a hardware/network readiness measurement.
+  uint32_t elapsed = millis() - bootScreenStarted;
+  uint32_t progressDuration = BOOT_SCREEN_DURATION_MS - 200;
+  uint8_t percent = elapsed >= progressDuration ? 100 : elapsed * 100UL / progressDuration;
+  lcd.drawFrame(8, 41, 112, 9);
+  uint8_t width = 108UL * percent / 100;
+  if (width) lcd.drawBox(10, 43, width, 5);
+  char text[22];
+  snprintf(text, sizeof(text), "BOOTING... %u%%", percent);
+  centered(text, 62);
+}
+
 void drawPage() {
   if (!displayReady) return;
   lcd.clearBuffer();
+
+  if (bootScreenActive) {
+    drawBootScreen();
+    lcd.sendBuffer();
+    return;
+  }
+
+  if (webSetupActive) {
+    lcd.setDrawColor(1);
+    lcd.setFont(u8g2_font_5x7_tf);
+    lcd.drawStr(2, 9, "WEB SETUP - HOTSPOT");
+    lcd.drawStr(2, 21, setupSsid);
+    char line[26];
+    snprintf(line, sizeof(line), "Password: %s", setupPassword);
+    lcd.drawStr(2, 32, line);
+    lcd.drawStr(2, 43, "http://192.168.4.1");
+    uint32_t remaining = setupRemainingSeconds();
+    snprintf(line, sizeof(line), "%s: %02lu:%02lu",
+             setupCloseAt ? "Menutup" : "Timeout idle",
+             (unsigned long)(remaining / 60), (unsigned long)(remaining % 60));
+    lcd.drawStr(2, 53, line);
+    lcd.drawStr(2, 63, "MENU: TUTUP HOTSPOT");
+    lcd.sendBuffer();
+    return;
+  }
 
   if (uiMode != UI_NORMAL) {
     drawConfigMenu();
@@ -957,6 +1011,10 @@ void drawPage() {
 
 void handleButtons() {
   byte state = readPCF8574();
+  if (bootScreenActive) {
+    lastState = state;
+    return;
+  }
   byte changed = lastState ^ state;
 
   if (millis() - lastDebounceTime > debounceDelay) {
@@ -965,7 +1023,12 @@ void handleButtons() {
       if ((changed & (1 << button)) && isPressed(state, button)) {
         manualPageHoldUntil = millis() + MANUAL_PAGE_HOLD_MS;
         lastPageChange = millis();
-        if (uiMode != UI_NORMAL) {
+        if (webSetupActive) {
+          if (button == BTN_MENU) {
+            if (setupCloseAt) networkApplyPending = true;
+            stopWebSetup();
+          }
+        } else if (uiMode != UI_NORMAL) {
           handleMenuButton(button);
         } else if (button == BTN_MENU) {
           enterConfigMenu();
@@ -1003,8 +1066,23 @@ void startupTask() {
 
     lcd.begin();
     displayReady = true;
+    bootScreenStarted = millis();
+    lastBootFrame = bootScreenStarted;
     startupState = START_READY;
     drawPage();
+  }
+  if (displayReady && bootScreenActive) {
+    now = millis();
+    if (now - bootScreenStarted >= BOOT_SCREEN_DURATION_MS) {
+      bootScreenActive = false;
+      currentPage = PAGE_HOME;
+      lastPageChange = now;
+      manualPageHoldUntil = now;
+      drawPage();
+    } else if (now - lastBootFrame >= BOOT_FRAME_INTERVAL_MS) {
+      lastBootFrame = now;
+      drawPage();
+    }
   }
 }
 
@@ -1014,7 +1092,7 @@ void voltageTask() {
   readBoardVoltage();
 }
 void autoPageTask() {
-  if (!config.autoPageEnabled || uiMode != UI_NORMAL || !displayReady) return;
+  if (bootScreenActive || !config.autoPageEnabled || uiMode != UI_NORMAL || !displayReady) return;
 
   unsigned long now = millis();
   if ((int32_t)(now - manualPageHoldUntil) < 0) return;
@@ -1192,7 +1270,7 @@ void telemetryTask() {
   }
 
   uint32_t interval = telemetryLastSuccess
-                        ? TELEMETRY_SEND_INTERVAL
+                        ? networkConfig.intervalSeconds * 1000UL
                         : TELEMETRY_RETRY_INTERVAL;
   if (telemetryEverAttempted && now - lastTelemetryAttempt < interval) return;
 
@@ -1228,15 +1306,22 @@ void telemetryTask() {
 
   digitalWrite(LCD_CS, LOW);
   telemetryClient.stop();
-  if (!telemetryClient.connect(TELEMETRY_SERVER, TELEMETRY_PORT)) {
-    Serial.println("[HTTP] Tidak dapat terhubung ke 192.168.8.7:8000.");
+  if (!telemetryClient.connect(telemetryHost.c_str(), telemetryPort)) {
+    Serial.printf("[HTTP] Tidak dapat terhubung ke %s:%u.\n", telemetryHost.c_str(), telemetryPort);
     return;
   }
 
   telemetryClient.print("POST ");
-  telemetryClient.print(TELEMETRY_PATH);
+  telemetryClient.print(telemetryPath);
   telemetryClient.println(" HTTP/1.1");
-  telemetryClient.println("Host: 192.168.8.7:8000");
+  telemetryClient.print("Host: ");
+  telemetryClient.print(telemetryHost);
+  telemetryClient.print(':');
+  telemetryClient.println(telemetryPort);
+  if (networkConfig.token[0]) {
+    telemetryClient.print("Authorization: Bearer ");
+    telemetryClient.println(networkConfig.token);
+  }
   telemetryClient.println("Content-Type: application/json");
   telemetryClient.println("Accept: application/json");
   telemetryClient.println("Connection: close");
@@ -1254,6 +1339,7 @@ void telemetryTask() {
 void setup() {
   Serial.begin(115200);
   loadConfig();
+  loadNetworkConfig();
   analogReadResolution(12);
   initMacAddress();
   telemetryClient.setConnectionTimeout(TCP_CONNECTION_TIMEOUT);
@@ -1279,6 +1365,20 @@ void setup() {
 }
 
 void loop() {
+  webSetupTask();
+  if (networkApplyPending && telemetryState == TELEMETRY_IDLE) {
+    networkApplyPending = false;
+    networkConfig = pendingNetworkConfig;
+    parseEndpoint(networkConfig.endpoint, telemetryHost, telemetryPort, telemetryPath);
+    client.stop();
+    ntpUdp.stop();
+    ntpUdpStarted = false;
+    ntpState = NTP_IDLE;
+    ethernetReady = false;
+    telemetryEverAttempted = false;
+    lastDHCPAttempt = millis() - DHCP_RETRY_INTERVAL;
+    drawPage();
+  }
   startupTask();
   voltageTask();
   rtcTask();
@@ -1343,7 +1443,18 @@ void attemptDhcp() {
   digitalWrite(LCD_CS, LOW);
 
   Serial.println("[LAN] Request DHCP...");
-  int dhcpResult = Ethernet.begin(mac, DHCP_TIMEOUT, DHCP_RESPONSE_TIMEOUT);
+  int dhcpResult = 1;
+  if (networkConfig.dhcp) {
+    dhcpResult = Ethernet.begin(mac, DHCP_TIMEOUT, DHCP_RESPONSE_TIMEOUT);
+  } else {
+    IPAddress ip, dns, gateway, subnet;
+    ip.fromString(networkConfig.ip);
+    dns.fromString(networkConfig.dns);
+    gateway.fromString(networkConfig.gateway);
+    subnet.fromString(networkConfig.subnet);
+    Ethernet.begin(mac, ip, dns, gateway, subnet);
+    dhcpResult = Ethernet.linkStatus() == LinkON;
+  }
   ethernetHardwareDetected = Ethernet.hardwareStatus() == EthernetW5500;
 
   if (!ethernetHardwareDetected) {
@@ -1363,7 +1474,7 @@ void attemptDhcp() {
   ethernetReady = true;
   dhcpMaintenanceFailures = 0;
   lanStatus = LAN_CONNECTED;
-  Serial.println("[LAN] DHCP berhasil.");
+  Serial.println(networkConfig.dhcp ? "[LAN] DHCP berhasil." : "[LAN] IP statis diterapkan.");
   Serial.print("[LAN] IP      : "); Serial.println(Ethernet.localIP());
   Serial.print("[LAN] Gateway : "); Serial.println(Ethernet.gatewayIP());
   Serial.print("[LAN] DNS     : "); Serial.println(Ethernet.dnsServerIP());
@@ -1372,7 +1483,8 @@ void attemptDhcp() {
 }
 
 void ethernetTask() {
-  if (!networkHardwareReady) return;
+  // DHCP/connect are synchronous; start them after the splash for smooth frames.
+  if (!networkHardwareReady || bootScreenActive) return;
   unsigned long now = millis();
 
   if (ethernetHardwareDetected && Ethernet.linkStatus() == LinkOFF) {
@@ -1392,7 +1504,7 @@ void ethernetTask() {
 
   lanStatus = LAN_CONNECTED;
 
-  if (now - lastDhcpMaintain >= DHCP_MAINTAIN_INTERVAL) {
+  if (networkConfig.dhcp && now - lastDhcpMaintain >= DHCP_MAINTAIN_INTERVAL) {
     lastDhcpMaintain = now;
     int result = Ethernet.maintain();
     if (result == 1 || result == 3) {
